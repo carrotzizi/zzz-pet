@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 调试时的临时产物（tools/shot.py 和诊断脚本写出来的）
+tools/_*.png
+tools/_*.log
+*.sqlite
+
+# 宠物素材不进仓库：精灵图是 Petdex 上别人提交的同人像素画，
+# 角色版权属于游戏方，不适合再分发一份。用这个装：
+#   npx -y petdex install eous
+assets/
+
+# 运行期状态（每个人的机器上都不一样）
+*.lnk
