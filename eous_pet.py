@@ -138,6 +138,13 @@ DEFAULT_SCALE = 0.5  # 默认「小」
 
 # 模型调用速度的数据源：ZCode 的会话数据库。
 SPEED_DB = HOME / ".zcode" / "cli" / "db" / "db.sqlite"
+
+# 右键菜单的观感（Tk 用系统原生菜单，能调的只有字体和配色）
+MENU_BG = "#1f2128"
+MENU_FG = "#e9e7e4"
+MENU_DISABLED = "#6d7079"
+MENU_FONT = ("Microsoft YaHei UI", 10)
+
 SPEED_POLL_S = 1.0
 SPEED_HISTORY = 8  # 保留最近几次调用，用来算平均速度
 ACCENT = (255, 138, 32)
@@ -1004,15 +1011,46 @@ class Pet:
         self.menu.add_checkbutton(label="显示气泡", variable=self.var_bub, command=self._toggle_bubbles)
         self.menu.add_checkbutton(label="显示速度", variable=self.var_speed, command=self._toggle_speed)
         self.menu.add_separator()
-
-        self.menu.add_separator()
-        self.menu.add_command(label="关于", command=self._about)
         self.menu.add_command(label="退出", command=self.quit)
+        self._style_menu(self.menu)
 
-    def _about(self) -> None:
-        extra_count = len([s for s in self._photos if s.startswith("extra-")])
-        extra = f"\n外加 {extra_count} 个专属动作" if extra_count else ""
-        self.say(f"{self.pet_name}\nPetdex 桌面宠物{extra}", 5)
+    def _all_menus(self, menu: tk.Menu) -> list[tk.Menu]:
+        """把菜单和它的级联子菜单一起收集出来。"""
+        out = [menu]
+        end = menu.index("end")
+        if end is not None:
+            for i in range(end + 1):
+                try:
+                    if menu.type(i) == "cascade":
+                        out += self._all_menus(menu.nametowidget(menu.entrycget(i, "menu")))
+                except tk.TclError:
+                    continue  # 这一项不是菜单（分隔线之类）
+        return out
+
+    def _style_menu(self, menu: tk.Menu) -> None:
+        """给菜单上色：深色底、宠物主色做选中高亮。
+
+        Tk 用的是系统原生菜单，圆角、图标这类做不了；字体、配色、间距倒是都能改，
+        改完和默认那套 Win32 灰菜单完全是两种观感。主色取自当前宠物，
+        所以换宠物时菜单会跟着换色（set_pet 里会再调一次）。
+        """
+        accent = self.accent
+        hexed = "#%02x%02x%02x" % accent
+        # 浅色主色（比如 remielle-2 的粉）上要配深色字，深色主色上才配白字
+        bright = 0.299 * accent[0] + 0.587 * accent[1] + 0.114 * accent[2]
+        active_fg = "#1b1b1b" if bright > 150 else "#ffffff"
+        for m in self._all_menus(menu):
+            try:
+                m.configure(
+                    font=MENU_FONT,
+                    bg=MENU_BG, fg=MENU_FG,
+                    activebackground=hexed, activeforeground=active_fg,
+                    selectcolor=hexed,  # 勾选/单选标记的颜色
+                    disabledforeground=MENU_DISABLED,
+                    activeborderwidth=0, bd=0, relief="flat",
+                )
+            except tk.TclError:
+                pass
 
     def _on_menu(self, event) -> None:
         try:
@@ -1066,7 +1104,8 @@ class Pet:
         self._raw, self.cell_w, self.cell_h = raw, cw, ch
         self._scaled = scale_frames(self._raw, self.scale)
         self._build_photos()
-        self.accent = dominant_color(self._raw["idle"])  # 速度条跟着新宠物换色
+        self.accent = dominant_color(self._raw["idle"])  # 速度条和菜单都跟着新宠物换色
+        self._style_menu(self.menu)
         # 换了宠物帧数和尺寸都可能变，状态归零免得索引越界
         self.state = "idle"
         self._state_until = None
