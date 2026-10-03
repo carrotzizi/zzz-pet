@@ -23,6 +23,7 @@ import os
 import queue
 import random
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -35,6 +36,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from PIL import Image, ImageDraw, ImageFont, ImageTk
+from tkinter import messagebox
 
 APP_NAME = "eous-pet"
 HOME = Path.home()
@@ -189,6 +191,182 @@ DPI_SCALE = 1.0
 class _RECT(ctypes.Structure):
     _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
                 ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
+# --------------------------------------------------------------------------- #
+# 桌面整理
+# --------------------------------------------------------------------------- #
+DESKTOP_PREFIX = "桌面整理_"
+DESKTOP_LOG = "_整理记录.json"
+DESKTOP_OTHER = "其他"
+# 按扩展名归类；同一后缀只出现在一处，顺序无所谓
+DESKTOP_CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("图片", (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg", ".ico",
+              ".heic", ".tif", ".tiff", ".psd", ".ai")),
+    ("文档", (".pdf", ".txt", ".md", ".doc", ".docx", ".rtf", ".odt",
+              ".xls", ".xlsx", ".csv", ".ppt", ".pptx", ".wps", ".et")),
+    ("压缩包", (".zip", ".rar", ".7z", ".tar", ".gz", ".xz", ".bz2", ".iso")),
+    ("安装包", (".exe", ".msi", ".msix", ".appx")),
+    ("音视频", (".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm", ".rmvb",
+                ".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg")),
+    ("代码", (".py", ".js", ".ts", ".java", ".c", ".cpp", ".h", ".hpp", ".go", ".rs",
+              ".json", ".xml", ".yml", ".yaml", ".sql", ".sh", ".bat", ".ps1",
+              ".html", ".css", ".ipynb")),
+    ("快捷方式", (".lnk", ".url")),
+)
+
+
+def desktop_dir() -> Path:
+    """当前用户的桌面目录。
+
+    不能假设是 `~/Desktop`——OneDrive 会把桌面重定向到它自己的目录下，
+    所以这里问注册表（`winreg` 是标准库，不用装东西）。
+    """
+    try:
+        import winreg
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+        ) as key:
+            raw, _ = winreg.QueryValueEx(key, "Desktop")
+        path = Path(os.path.expandvars(raw))
+        if path.is_dir():
+            return path
+    except (ImportError, OSError):
+        pass
+    return Path.home() / "Desktop"
+
+
+def categorize(name: str) -> str:
+    """按扩展名归类，认不出来的一律进「其他」。"""
+    suffix = Path(name).suffix.lower()
+    for category, extensions in DESKTOP_CATEGORIES:
+        if suffix in extensions:
+            return category
+    return DESKTOP_OTHER
+
+
+def _unique_path(path: Path) -> Path:
+    """目标重名就加 (2)(3)——绝不覆盖已有文件。"""
+    if not path.exists():
+        return path
+    for i in range(2, 1000):
+        candidate = path.with_name(f"{path.stem} ({i}){path.suffix}")
+        if not candidate.exists():
+            return candidate
+    return path.with_name(f"{path.stem} ({time.time_ns()}){path.suffix}")
+
+
+def collect_desktop_files(folder: Path) -> list[Path]:
+    """桌面上"可以整理"的文件。
+
+    只收常规文件：**跳过文件夹、符号链接、隐藏和系统文件**（`desktop.ini` 就在
+    这一类里），也不碰之前整理出来的目录，免得把整理结果再整理一遍。
+    """
+    out: list[Path] = []
+    try:
+        entries = list(folder.iterdir())
+    except OSError:
+        return out
+    for item in entries:
+        try:
+            if not item.is_file() or item.is_symlink() or item.name.startswith("."):
+                continue
+            attrs = getattr(item.stat(), "st_file_attributes", 0)
+        except OSError:
+            continue
+        if attrs & (stat.FILE_ATTRIBUTE_HIDDEN | stat.FILE_ATTRIBUTE_SYSTEM):
+            continue
+        if item.name.startswith(DESKTOP_PREFIX):
+            continue
+        out.append(item)
+    return out
+
+
+def organize_desktop(folder: Path) -> tuple[int, Path | None]:
+    """把桌面散落的文件按类型归进 `桌面整理_<日期>/` 下。
+
+    只移动、不删除；每次移动都写进 `_整理记录.json`，所以随时能撤销。
+    返回 (移动了几个, 目标目录)。
+    """
+    files = collect_desktop_files(folder)
+    if not files:
+        return 0, None
+    dest_root = folder / f"{DESKTOP_PREFIX}{time.strftime('%Y%m%d')}"
+    moved: list[dict[str, str]] = []
+    for src in files:
+        try:
+            target_dir = dest_root / categorize(src.name)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target = _unique_path(target_dir / src.name)
+            src.rename(target)  # 同一个卷内，是原子移动不是复制
+        except OSError:
+            continue  # 单个文件被占用就跳过，不影响其余的
+        moved.append({"from": str(src), "to": str(target)})
+    if not moved:
+        return 0, None
+    try:
+        (dest_root / DESKTOP_LOG).write_text(
+            json.dumps(moved, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except OSError:
+        pass
+    return len(moved), dest_root
+
+
+def undo_desktop(folder: Path) -> tuple[int, bool]:
+    """撤销最近一次整理：按记录把文件搬回桌面。
+
+    返回 (搬回几个, 有没有找到记录)。搬完如果那个日期目录空了就顺手删掉。
+    """
+    try:
+        roots = sorted(
+            (p for p in folder.iterdir()
+             if p.is_dir() and p.name.startswith(DESKTOP_PREFIX)),
+            reverse=True,
+        )
+    except OSError:
+        return 0, False
+    for root in roots:
+        log = root / DESKTOP_LOG
+        if not log.is_file():
+            continue
+        try:
+            moves = json.loads(log.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        back = 0
+        for item in moves:
+            src, dst = Path(item["to"]), Path(item["from"])
+            try:
+                if src.is_file():
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    src.rename(_unique_path(dst))
+                    back += 1
+            except OSError:
+                continue
+        if back and back == len(moves):
+            # 全部还原成功，日志和空目录就没意义了，一起清掉
+            # （只还原了一部分的话都留着，还能再试）
+            try:
+                log.unlink()
+            except OSError:
+                pass
+            _prune_empty(root)
+        return back, True
+    return 0, False
+
+
+def _prune_empty(root: Path) -> None:
+    """搬空了就把日期目录和它的空分类目录删掉，别留一堆空壳。"""
+    try:
+        for child in root.iterdir():
+            if child.is_dir() and not any(child.iterdir()):
+                child.rmdir()
+        if not any(root.iterdir()):
+            root.rmdir()
+    except OSError:
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -1032,6 +1210,10 @@ class Pet:
         self.menu.add_checkbutton(label="显示气泡", variable=self.var_bub, command=self._toggle_bubbles)
         self.menu.add_checkbutton(label="显示速度", variable=self.var_speed, command=self._toggle_speed)
         self.menu.add_separator()
+        self.menu.add_separator()
+        self.menu.add_command(label="整理桌面", command=self.organize_desktop_clicked)
+        self.menu.add_command(label="撤销整理", command=self.undo_desktop_clicked)
+        self.menu.add_separator()
         self.menu.add_command(label="退出", command=self.quit)
         self._style_menu(self.menu)
 
@@ -1299,6 +1481,10 @@ class Pet:
                 self.say(str(value), extra or 4.0)
             elif kind == "desktop":
                 self._after_show_desktop(value == "ok")
+            elif kind == "organized":
+                self._after_organize(int(value), bool(extra))
+            elif kind == "undo":
+                self._after_undo(int(value), bool(extra))
             elif kind == "quit":
                 self.quit()
 
@@ -1350,6 +1536,57 @@ class Pet:
             CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
         except OSError:
             pass
+
+    # -- 桌面整理 ---------------------------------------------------------- #
+    def organize_desktop_clicked(self) -> None:
+        """菜单入口：先数一下有几个文件，问一声再动手。
+
+        动的是真实文件，所以：只移动不删除、跳过文件夹和隐藏文件、
+        带日期的子目录、记日志可撤销——外加这一道确认。
+        """
+        folder = desktop_dir()
+        count = len(collect_desktop_files(folder))
+        if not count:
+            self.say("桌面已经很干净了", 4)
+            return
+        stamp = time.strftime("%Y%m%d")
+        ok = messagebox.askyesno(
+            "整理桌面",
+            f"把桌面上的 {count} 个文件按类型归到「{DESKTOP_PREFIX}{stamp}」里？\n\n"
+            "· 只移动，不删除\n"
+            "· 文件夹和隐藏文件不会动\n"
+            "· 随时可以「撤销整理」还原",
+            parent=self.root,
+        )
+        if not ok:
+            self.say("那就算了", 3)
+            return
+        threading.Thread(target=self._organize_worker, daemon=True).start()
+
+    def _organize_worker(self) -> None:
+        count, dest = organize_desktop(desktop_dir())
+        self.events.put(("organized", count, dest is not None))
+
+    def _after_organize(self, count: int, ok: bool) -> None:
+        if not ok:
+            self.say("没能整理，文件可能正被占用", 4)
+        else:
+            self.say(f"桌面整理好了 √\n{count} 个文件已归类\n想还原就用「撤销整理」", 6)
+
+    def undo_desktop_clicked(self) -> None:
+        threading.Thread(target=self._undo_worker, daemon=True).start()
+
+    def _undo_worker(self) -> None:
+        back, found = undo_desktop(desktop_dir())
+        self.events.put(("undo", back, found))
+
+    def _after_undo(self, back: int, found: bool) -> None:
+        if not found:
+            self.say("还没有整理过", 3)
+        elif not back:
+            self.say("没找到能还原的文件", 4)
+        else:
+            self.say(f"把 {back} 个文件放回桌面了", 4)
 
     # -- 显示桌面 ---------------------------------------------------------- #
     def _on_double_click(self, _event) -> None:
