@@ -1,5 +1,6 @@
 """合成事件自检：验证拖拽/单击/缩放/气泡/速度条/换宠物逻辑，不触碰真实鼠标。"""
 
+import ctypes
 import shutil
 import sqlite3
 import sys
@@ -83,6 +84,33 @@ assert pet._clamp(-3000, 50)[0] == -1920, "负方向越界没被拉回"
 print("副屏在主屏左边（负坐标）：正确")
 pet.screens = saved_screens
 print(f"本机实际显示器: {pet.screens}")
+
+# 抖音浮窗：只测纯逻辑，不在自检里真开浏览器
+br = E.find_browser()
+assert br is None or Path(br).is_file(), f"找到的浏览器路径不存在: {br}"
+print(f"浏览器: {br}")
+assert E.rects_overlap((0, 0, 10, 10), (5, 5, 10, 10)) is True
+assert E.rects_overlap((0, 0, 10, 10), (10, 0, 10, 10)) is False, "贴边不算重叠"
+assert E.rects_overlap((0, 0, 10, 10), (20, 20, 5, 5)) is False
+print("rects_overlap ok")
+
+wins = E.chromium_windows()
+assert isinstance(wins, dict), "chromium_windows 应当返回 hwnd -> 信息 的字典"
+for hwnd, info in wins.items():
+    assert len(info) == 5 and info[2] >= 0 and info[3] >= 0
+print(f"当前 Chromium 窗口: {len(wins)} 个（识别浮窗靠启动前后的差集）")
+
+screen_w, screen_h = root.winfo_screenwidth(), root.winfo_screenheight()
+dx, dy, dw, dh = pet._douyin_rect()
+assert (dw, dh) == E.DOUYIN_SIZE, f"浮窗尺寸不对: {dw}x{dh}"
+assert 0 <= dx and dx + dw <= screen_w, f"浮窗横向越界: x={dx} w={dw} 屏宽={screen_w}"
+assert 0 <= dy and dy + dh <= screen_h, f"浮窗纵向越界: y={dy} h={dh} 屏高={screen_h}"
+print(f"浮窗落点: ({dx},{dy}) {dw}x{dh}（屏幕 {screen_w}x{screen_h}）")
+
+# Win32 参数类型必须声明过，否则 SetWindowPos 会静默失败（踩过这个坑）
+assert ctypes.windll.user32.SetWindowPos.argtypes is not None, \
+    "SetWindowPos 没声明 argtypes —— 64 位下 HWND_TOPMOST(-1) 会传错，摆位和置顶都会静默失效"
+print("SetWindowPos argtypes 已声明 ok")
 
 # 单击（不动）
 pet._on_press(Ev(500, 500))
