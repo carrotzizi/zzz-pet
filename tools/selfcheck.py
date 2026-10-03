@@ -277,59 +277,6 @@ print("手动关掉显示速度 -> 无论是否在跑都隐藏:", pet._stats_ite
 assert pet._stats_item is None
 pet.show_speed = True
 
-# 番茄钟：计时、到点、重启恢复
-assert [E.fmt_clock(s) for s in (0, 59, 61, 3599, 3600)] == \
-    ["00:00", "00:59", "01:01", "59:59", "1:00:00"]
-print("fmt_clock ok")
-
-pomo = E.Pomodoro()
-assert not pomo.active
-pomo.start("focus", 25)
-assert pomo.active and 1499 < pomo.remaining_s() <= 1500 and pomo.progress() < 0.01
-pomo.end_ms = int(time.time() * 1000) - 1  # 直接把结束时刻设成过去，模拟到点
-assert pomo.due() == "focus" and pomo.rounds == 1 and not pomo.active
-pomo.start("break", 5)
-pomo.end_ms = int(time.time() * 1000) - 1
-assert pomo.due() == "break" and pomo.rounds == 1, "休息不该增加专注轮数"
-assert E.Pomodoro({"pomodoro_kind": "focus", "pomodoro_end": 1, "pomodoro_total": 1500}).active is False, \
-    "早就过期的一轮不该被捡起来"
-snap = {"pomodoro_kind": "focus", "pomodoro_end": int(time.time() * 1000) + 60000,
-        "pomodoro_total": 1500, "pomodoro_rounds": 2, "pomodoro_sound": True}
-resumed = E.Pomodoro(snap)
-assert resumed.active and resumed.kind == "focus" and resumed.rounds == 2
-assert abs(resumed.remaining_s() - 60) < 2, "恢复后的剩余时间不对"
-print("Pomodoro 计时/到点/轮数/重启恢复 ok")
-
-# 番茄钟有自己的那一行，不该去顶速度条
-saved_pomo = pet.pomodoro
-pet.turn_watcher = FakeTurns(active=False)  # 故意让「任务不在跑」
-pet.pomodoro = E.Pomodoro()
-pet._rebuild_geometry()
-root.update()
-assert pet.timer_h == 0 and pet._timer_item is None, "没番茄钟时不该有倒计时那一行"
-assert pet._stats_item is None, "没番茄钟、任务也不在跑时不该显示速度"
-
-pet.pomodoro.start("focus", 25)
-pet._rebuild_geometry()
-root.update()
-assert pet.timer_h > 0 and pet._timer_item is not None, "番茄钟应当有自己那一行"
-assert pet._stats_item is None, "任务没在跑时，速度条不该被番茄钟顶出来"
-view = (E.Pomodoro.label(pet.pomodoro.kind), E.fmt_clock(pet.pomodoro.remaining_s()),
-        pet.pomodoro.progress())
-img = E.render_stats(None, pet.win_w, pet.timer_h, 1.5, pet.accent, view)
-assert img is not None and img.size == (pet.win_w, pet.timer_h), "倒计时没画出来"
-assert view[0] == "专注" and ":" in view[1]
-print(f"番茄倒计时单独占一行 ok -> {view[0]} {view[1]}，timer_h={pet.timer_h}")
-
-pet.pomodoro.stop()
-pet.turn_watcher = FakeTurns(active=True)  # 这回让任务在跑
-pet._rebuild_geometry()
-root.update()
-assert pet.timer_h == 0 and pet._timer_item is None, "番茄钟停下后那一行应当收回"
-assert pet._stats_item is not None, "任务在跑，速度条该自己出来（与番茄钟无关）"
-print("番茄钟结束后那一行收回、速度条不受影响 ok")
-pet.pomodoro = saved_pomo
-
 # 换宠物：8x9 和 8x11 两种网格都要能加载
 print(f"可选宠物 {len(pets)} 只")
 accents = {}

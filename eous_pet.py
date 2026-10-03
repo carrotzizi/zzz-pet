@@ -66,8 +66,6 @@ FRAME_MS = {
     "waiting": 150,
 }
 
-FOCUS_MIN = 25
-BREAK_MIN = 5
 
 CHATTER = [
     "在的！",
@@ -146,9 +144,6 @@ ACCENT = (255, 138, 32)
 
 
 
-ALARM_TTL_S = 20.0  # 番茄钟到点时的气泡停留时间，比闲聊长，免得一转头就错过
-
-
 def fmt_duration(ms: float) -> str:
     """把毫秒说成人话：23 秒 / 3 分 12 秒 / 1 小时 5 分。"""
     total = max(0, round(ms / 1000))
@@ -159,105 +154,6 @@ def fmt_duration(ms: float) -> str:
         return f"{minutes} 分 {seconds} 秒" if seconds else f"{minutes} 分"
     hours, minutes = divmod(minutes, 60)
     return f"{hours} 小时 {minutes} 分" if minutes else f"{hours} 小时"
-
-
-def fmt_clock(seconds: float) -> str:
-    """秒数说成 24:31 或 1:05:00。"""
-    total = max(0, int(round(seconds)))
-    minutes, secs = divmod(total, 60)
-    if minutes < 60:
-        return f"{minutes:02d}:{secs:02d}"
-    hours, minutes = divmod(minutes, 60)
-    return f"{hours}:{minutes:02d}:{secs:02d}"
-
-
-def _chime(times: int = 3, gap_ms: int = 600) -> None:
-    """响几声系统提示音。winsound 是标准库，不用装东西。"""
-    try:
-        import winsound
-    except ImportError:
-        return
-    for i in range(times):
-        # MessageBeep 是异步的，隔开一点才听得出一声一声；
-        # 用守护线程，免得退出时还要等这几声放完。
-        timer = threading.Timer(i * gap_ms / 1000.0, lambda: _safe_beep(winsound))
-        timer.daemon = True
-        timer.start()
-
-
-def _safe_beep(winsound) -> None:
-    try:
-        winsound.MessageBeep(winsound.MB_ICONASTERISK)
-    except Exception:  # noqa: BLE001 — 响不了就算了，不能影响宠物本身
-        pass
-
-
-class Pomodoro:
-    """番茄专注闹钟。
-
-    只存"结束时刻 + 总时长 + 类型"，不存"还剩多少秒"——因为宠物会被 ZCode
-    重启顺手带走（在工具调用里启动的话就是子进程），存剩余秒数的话一重启
-    计时就悄悄没了；存绝对结束时刻就能接着走。
-    """
-
-    def __init__(self, cfg: dict | None = None):
-        cfg = cfg or {}
-        self.kind: str | None = None
-        self.total_s = 0.0
-        self.end_ms = 0
-        self.rounds = int(cfg.get("pomodoro_rounds") or 0)
-
-        kind = cfg.get("pomodoro_kind")
-        end_ms = int(cfg.get("pomodoro_end") or 0)
-        total_s = float(cfg.get("pomodoro_total") or 0)
-        if kind in ("focus", "break") and total_s > 0 and end_ms > time.time() * 1000:
-            self.kind, self.end_ms, self.total_s = kind, end_ms, total_s  # 接着上一轮走
-
-    @property
-    def active(self) -> bool:
-        return self.kind is not None
-
-    @staticmethod
-    def label(kind: str | None) -> str:
-        return "专注" if kind == "focus" else "休息"
-
-    def start(self, kind: str, minutes: float) -> None:
-        self.kind = kind
-        self.total_s = max(0.1, minutes) * 60.0
-        self.end_ms = int(time.time() * 1000 + self.total_s * 1000)
-
-    def stop(self) -> None:
-        self.kind = None
-        self.total_s = 0.0
-        self.end_ms = 0
-
-    def remaining_s(self) -> float:
-        return max(0.0, (self.end_ms - time.time() * 1000) / 1000.0)
-
-    def progress(self) -> float:
-        """已经过去的比例，0~1，用来在药丸里填进度条。"""
-        if self.total_s <= 0:
-            return 0.0
-        return max(0.0, min(1.0, 1.0 - self.remaining_s() / self.total_s))
-
-    def due(self) -> str | None:
-        """到点了就返回刚结束的那一轮类型，并清掉计时。"""
-        if not self.active or self.remaining_s() > 0:
-            return None
-        kind = self.kind
-        if kind == "focus":
-            self.rounds += 1
-        self.stop()
-        return kind
-
-    def snapshot(self) -> dict:
-        """写进配置的字段。"""
-        return {
-            "pomodoro_kind": self.kind,
-            "pomodoro_end": self.end_ms if self.active else 0,
-            "pomodoro_total": self.total_s,
-            "pomodoro_rounds": self.rounds,
-        }
 
 
 def enable_dpi_awareness() -> float:
@@ -582,17 +478,6 @@ class Bridge(BaseHTTPRequestHandler):
                 payload["task_active"] = bool(
                     self.pet.turn_watcher and self.pet.turn_watcher.is_active()
                 )
-                pomo = self.pet.pomodoro
-                payload["pomodoro"] = (
-                    {
-                        "kind": pomo.kind,
-                        "remaining_s": round(pomo.remaining_s(), 1),
-                        "progress": round(pomo.progress(), 3),
-                        "rounds": pomo.rounds,
-                    }
-                    if pomo.active
-                    else None
-                )
             stat = self._speed_stat()
             if stat:
                 payload["speed"] = stat
@@ -914,23 +799,12 @@ def _mix(a: tuple[int, int, int], b: tuple[int, int, int], t: float) -> tuple[in
 
 
 def render_stats(stat: dict | None, width: int, height: int, dpi: float,
-                 accent: tuple[int, int, int] = ACCENT,
-                 pomodoro: tuple[str, str, float] | None = None) -> Image.Image | None:
-    """画底部那条小药丸：有番茄钟就画倒计时，否则画速度；都没内容就返回 None。
-
-    pomodoro 传 (标题, 剩余时间, 进度) 三元组，进度用来在药丸内部填一条进度条。
-    """
-    if width <= 0 or height <= 0:
+                 accent: tuple[int, int, int] = ACCENT) -> Image.Image | None:
+    """把模型调用速度画成一条圆角小药丸；没有数据就返回 None（这一行留空）。"""
+    if not stat or width <= 0 or height <= 0:
         return None
-    progress: float | None = None
-    if pomodoro is not None:
-        text = f"{pomodoro[0]} {pomodoro[1]}"
-        progress = max(0.0, min(1.0, pomodoro[2]))
-    elif stat:
-        rate = stat["rate"]
-        text = f"{rate:.0f} tok/s" if rate >= 10 else f"{rate:.1f} tok/s"
-    else:
-        return None
+    rate = stat["rate"]
+    text = f"{rate:.0f} tok/s" if rate >= 10 else f"{rate:.1f} tok/s"
 
     ss = 3  # 超采样，让圆角和文字都顺一点
     w, h = width * ss, height * ss
@@ -958,23 +832,10 @@ def render_stats(stat: dict | None, width: int, height: int, dpi: float,
     pill_w = int(min(w - margin * 2, need))
     x0 = (w - pill_w) // 2
     y0 = (h - pill_h) // 2
-    fill = (*_mix((20, 22, 28), accent, 0.16), 236)  # 药丸底色也沾一点主色
-    radius = pill_h // 2
-    draw.rounded_rectangle((x0, y0, x0 + pill_w, y0 + pill_h), radius=radius, fill=fill)
-
-    if progress is not None and progress > 0:
-        # 番茄钟：把已经过去的部分填成实色，读起来就是一条进度条
-        filled_w = int((pill_w - 2) * progress)
-        if filled_w > 2:
-            draw.rounded_rectangle(
-                (x0 + 1, y0 + 1, x0 + 1 + filled_w, y0 + pill_h - 1),
-                radius=max(1, radius - 1),
-                fill=(*_mix((20, 22, 28), accent, 0.55), 255),
-            )
-
     draw.rounded_rectangle(
         (x0, y0, x0 + pill_w, y0 + pill_h),
-        radius=radius,
+        radius=pill_h // 2,
+        fill=(*_mix((20, 22, 28), accent, 0.16), 236),  # 底色也沾一点主色
         outline=(*accent, 255),
         width=max(1, int(1.1 * ss)),
     )
@@ -1010,9 +871,6 @@ class Pet:
         self.topmost = bool(cfg.get("topmost", True))
         self.show_bubbles = bool(cfg.get("bubbles", True))
         self.show_speed = bool(cfg.get("speed", True))
-        self.pomodoro = Pomodoro(cfg)
-        # 番茄钟到点响不响；chime 是后来的名字，回退读一次旧键 pomodoro_sound
-        self.chime = bool(cfg.get("chime", cfg.get("pomodoro_sound", True)))
         self.port = cfg.get("port")
 
         self._raw, self.cell_w, self.cell_h = load_frames(sheet_path)
@@ -1033,9 +891,6 @@ class Pet:
         self._stats_photo: ImageTk.PhotoImage | None = None
         self._stats_item = None
         self._stats_key = None
-        self._timer_photo: ImageTk.PhotoImage | None = None
-        self._timer_item = None
-        self._timer_key = None
         self._save_job = None
 
         self.screens = list_monitors() or [
@@ -1071,11 +926,9 @@ class Pet:
         sw, sh = self._sprite_size()
         self.bubble_h = bubble_height(self.scale) if self.show_bubbles else 0
         # 状态条给小尺寸留一个可读的字号下限，不然「小」档会糊成一团；
-        # 番茄倒计时单独占一行，不跟速度条挤在一起
         row_h = max(int(round(28 * self.scale)), int(round(17 * DPI_SCALE)))
         self.stats_h = row_h if self.show_speed else 0
-        self.timer_h = row_h if self.pomodoro.active else 0
-        self.win_w, self.win_h = sw, self.bubble_h + sh + self.timer_h + self.stats_h
+        self.win_w, self.win_h = sw, self.bubble_h + sh + self.stats_h
 
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", self.topmost)
@@ -1152,25 +1005,14 @@ class Pet:
         self.menu.add_checkbutton(label="显示速度", variable=self.var_speed, command=self._toggle_speed)
         self.menu.add_separator()
 
-        pomo_menu = tk.Menu(self.menu, tearoff=0)
-        for label, kind, minutes in (
-            ("开始专注 25 分钟", "focus", FOCUS_MIN),
-            ("开始专注 45 分钟", "focus", 45),
-            ("开始休息 5 分钟", "break", BREAK_MIN),
-            ("开始休息 15 分钟", "break", 15),
-        ):
-            pomo_menu.add_command(label=label,
-                                  command=lambda k=kind, m=minutes: self.start_pomodoro(k, m))
-        pomo_menu.add_separator()
-        pomo_menu.add_command(label="停止", command=self.stop_pomodoro)
-        self.menu.add_cascade(label="番茄钟", menu=pomo_menu)
-
-        self.var_chime = tk.BooleanVar(value=self.chime)
-        self.menu.add_checkbutton(label="提醒响一声", variable=self.var_chime,
-                                  command=self._toggle_chime)
         self.menu.add_separator()
         self.menu.add_command(label="关于", command=self._about)
         self.menu.add_command(label="退出", command=self.quit)
+
+    def _about(self) -> None:
+        extra_count = len([s for s in self._photos if s.startswith("extra-")])
+        extra = f"\n外加 {extra_count} 个专属动作" if extra_count else ""
+        self.say(f"{self.pet_name}\nPetdex 桌面宠物{extra}", 5)
 
     def _on_menu(self, event) -> None:
         try:
@@ -1195,47 +1037,6 @@ class Pet:
         self._rebuild_geometry()
         self._save()
 
-    # -- 番茄钟 ------------------------------------------------------------ #
-    def start_pomodoro(self, kind: str, minutes: float) -> None:
-        self.pomodoro.start(kind, minutes)
-        self._rebuild_geometry()  # 状态条本来没留位置的话要腾出来
-        # 专注时摆出「坐在电脑前打字」的姿势，正好是这个动作
-        self.set_state("waiting" if kind == "focus" else "review", minutes * 60 * 1000)
-        self.say(f"{Pomodoro.label(kind)} {fmt_clock(minutes * 60)}，开始！", 4)
-        self._save()
-
-    def stop_pomodoro(self) -> None:
-        if not self.pomodoro.active:
-            return
-        self.pomodoro.stop()
-        self._state_until = None
-        self.set_state("idle", 0)
-        self._rebuild_geometry()
-        self.say("番茄钟已停", 3)
-        self._save()
-
-    def _toggle_chime(self) -> None:
-        self.chime = bool(self.var_chime.get())
-        self._save()
-
-    def _pomodoro_alarm(self, ended: str) -> None:
-        """一轮到点：响铃 + 冒泡 + 做个动作。"""
-        if ended == "focus":
-            self.set_state("jumping", 2600)
-            self.say(f"专注结束 √\n已完成 {self.pomodoro.rounds} 轮\n起来活动一下吧", ALARM_TTL_S)
-        else:
-            self.set_state("waving", 2600)
-            self.say("休息结束\n回来继续吧", ALARM_TTL_S)
-        if self.chime:
-            _chime()
-        self._rebuild_geometry()  # 只为番茄钟留的状态条位置可以收回了
-        self._save()
-
-    def _about(self) -> None:
-        extra_count = len([s for s in self._photos if s.startswith("extra-")])
-        extra = f"\n外加 {extra_count} 个专属动作" if extra_count else ""
-        self.say(f"{self.pet_name}\nPetdex 桌面宠物{extra}", 5)
-
     # -- 布局 -------------------------------------------------------------- #
     def _rebuild_geometry(self) -> None:
         x, y = self.root.winfo_x(), self.root.winfo_y()
@@ -1245,8 +1046,7 @@ class Pet:
         self.canvas.configure(width=self.win_w, height=self.win_h)
         self.root.geometry(f"{self.win_w}x{self.win_h}+{x}+{y}")
         self.canvas.coords(self._sprite_item, 0, self.bubble_h)
-        self._stats_key = None  # 尺寸变了，两条药丸都得重画
-        self._timer_key = None
+        self._stats_key = None  # 尺寸变了，状态条必须重画
         self._rebuild_stats()
 
     def set_pet(self, name: str) -> None:
@@ -1353,22 +1153,6 @@ class Pet:
         self._bubble_until = None
 
     # -- 速度状态条 -------------------------------------------------------- #
-    def _strip_visible(self) -> bool:
-        """底部速度条该不该出现。
-
-        番茄钟有自己的那一行，不占这里，所以这里只看速度：任务进行时才显示，
-        没有活动检测可用时退回"一直显示"。
-        """
-        if not (self.show_speed and self.watcher):
-            return False
-        if self.turn_watcher is None:
-            return True
-        return self.turn_watcher.is_active()
-
-    def _timer_visible(self) -> bool:
-        """番茄倒计时那一行——只在计时跑着的时候占位。"""
-        return self.pomodoro.active and self.timer_h > 0
-
     def _paint(self, item, img: Image.Image | None, y: int):
         """把一条药丸画到画布上；img 为 None 就把这一行清掉。
 
@@ -1386,36 +1170,24 @@ class Pet:
             self.canvas.itemconfig(item, image=photo)
         return item, photo
 
-    def _rebuild_stats(self) -> None:
-        """重画宠物下面那两行药丸：先番茄倒计时（有的话），再速度。
+    def _strip_visible(self) -> bool:
+        """速度条该不该出现：只在任务进行时显示，免得挂着一个几分钟前的旧数字晃眼。
 
-        两行各自缓存，谁变了才重画谁；倒计时每秒都在变，所以它每秒重画一次。
+        没有活动检测可用时退回"一直显示"。
         """
-        sprite_h = self._sprite_size()[1]
-        timer_y = self.bubble_h + sprite_h
-        stats_y = timer_y + self.timer_h
+        if not (self.show_speed and self.watcher):
+            return False
+        if self.turn_watcher is None:
+            return True
+        return self.turn_watcher.is_active()
 
-        # 第一行：番茄倒计时
-        if self._timer_visible():
-            view = (
-                Pomodoro.label(self.pomodoro.kind),
-                fmt_clock(self.pomodoro.remaining_s()),
-                self.pomodoro.progress(),
-            )
-            key = ("timer",) + view
-            if key != self._timer_key:
-                self._timer_key = key
-                img = render_stats(None, self.win_w, self.timer_h, DPI_SCALE,
-                                   self.accent, view)
-                self._timer_item, self._timer_photo = self._paint(self._timer_item, img, timer_y)
-        elif self._timer_item is not None:
-            self._timer_key = None
-            self._timer_item, self._timer_photo = self._paint(self._timer_item, None, timer_y)
+    def _rebuild_stats(self) -> None:
+        """重画速度条；数值没变就直接返回，避免无谓地新建 PhotoImage。"""
+        y = self.bubble_h + self._sprite_size()[1]
 
-        # 第二行：模型速度
         if not self._strip_visible() or self.stats_h <= 0:
             if self._stats_item is not None:
-                self._stats_item, self._stats_photo = self._paint(self._stats_item, None, stats_y)
+                self._stats_item, self._stats_photo = self._paint(self._stats_item, None, y)
             self._stats_key = None
             return
 
@@ -1425,7 +1197,7 @@ class Pet:
             return
         self._stats_key = key
         img = render_stats(stat, self.win_w, self.stats_h, DPI_SCALE, self.accent)
-        self._stats_item, self._stats_photo = self._paint(self._stats_item, img, stats_y)
+        self._stats_item, self._stats_photo = self._paint(self._stats_item, img, y)
 
     def _ambient_pool(self) -> list[str]:
         """这只宠物能做的随机动作。
@@ -1475,9 +1247,6 @@ class Pet:
         if self._state_until and now >= self._state_until:
             self._state_until = None
             self.set_state("idle", 0)
-        ended = self.pomodoro.due()  # 放在状态过期之后：到点该响铃就响铃
-        if ended:
-            self._pomodoro_alarm(ended)
         if now >= self._next_ambient:
             self._ambient(now)
 
@@ -1509,10 +1278,8 @@ class Pet:
             topmost=self.topmost,
             bubbles=self.show_bubbles,
             speed=self.show_speed,
-            chime=self.chime,
             state=self.state,
             pet=self.pet_name,
-            **self.pomodoro.snapshot(),
         )
         if self.port:
             cfg["port"] = self.port
@@ -1538,15 +1305,14 @@ def cfg_get(key, default):
 # 预览（不需要窗口，用于自检）
 # --------------------------------------------------------------------------- #
 def preview(sheet_path: Path, out: Path, state: str, text: str, scale: float,
-            stat: dict | None = None,
-            pomodoro: tuple[str, str, float] | None = None) -> None:
+            stat: dict | None = None) -> None:
     frames, _, _ = load_frames(sheet_path)
     accent = dominant_color(frames["idle"])
     frames = scale_frames(frames, scale)
     sprite = frames[state][0]
     w, h = sprite.size
     bubble_h = bubble_height(scale)
-    stats_h = max(int(round(28 * scale)), int(round(17 * DPI_SCALE))) if (stat or pomodoro) else 0
+    stats_h = max(int(round(28 * scale)), int(round(17 * DPI_SCALE))) if stat else 0
     canvas = Image.new("RGB", (w, bubble_h + h + stats_h), (24, 26, 33))
 
     if text:
@@ -1554,7 +1320,7 @@ def preview(sheet_path: Path, out: Path, state: str, text: str, scale: float,
         canvas.paste(bubble, (0, 0), bubble)
     canvas.paste(sprite, (0, bubble_h), sprite)
     if stats_h:
-        strip = render_stats(stat, w, stats_h, DPI_SCALE, accent, pomodoro)
+        strip = render_stats(stat, w, stats_h, DPI_SCALE, accent)
         if strip is not None:
             canvas.paste(strip, (0, bubble_h + h), strip)
     canvas.save(out)
@@ -1577,8 +1343,6 @@ def main() -> None:
     ap.add_argument("--preview", help="只渲染一张预览图到指定路径后退出")
     ap.add_argument("--preview-state", default="idle")
     ap.add_argument("--preview-text", default="你好呀！")
-    ap.add_argument("--preview-pomodoro", type=float,
-                    help="预览时按番茄钟样式画状态条，参数是剩余分钟数")
     args = ap.parse_args()
 
     pets = discover_pets()
@@ -1605,13 +1369,8 @@ def main() -> None:
             stat = query_latest_speed(Path(args.db) if args.db else SPEED_DB)
         except (sqlite3.Error, OSError, ValueError):
             stat = None
-        pomo = None
-        if args.preview_pomodoro:
-            total = FOCUS_MIN * 60.0
-            left = max(0.0, args.preview_pomodoro * 60.0)
-            pomo = ("专注", fmt_clock(left), 1.0 - left / total)
         preview(sheet_path, Path(args.preview), args.preview_state, args.preview_text,
-                (args.scale or DEFAULT_SCALE) * DPI_SCALE, stat, pomo)
+                (args.scale or DEFAULT_SCALE) * DPI_SCALE, stat)
         return
 
     # 尺寸固定「小」——菜单里的三档去掉了，--scale 只留给预览和调试用
