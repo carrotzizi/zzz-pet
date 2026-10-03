@@ -22,9 +22,7 @@ import json
 import os
 import queue
 import random
-import shutil
 import sqlite3
-import subprocess
 import sys
 import threading
 import time
@@ -34,8 +32,6 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
-
-from ctypes import wintypes
 
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
@@ -189,185 +185,12 @@ def enable_dpi_awareness() -> float:
 DPI_SCALE = 1.0
 
 
-def _declare_win32() -> None:
-    """给用到的 Win32 函数声明参数类型。
-
-    64 位下这步不能省：HANDLE 是 64 位指针，不声明的话 ctypes 按 32 位 int 传，
-    `HWND_TOPMOST` 这个 -1 会变成 0x00000000FFFFFFFF —— 不是合法窗口句柄，
-    于是 SetWindowPos 整个调用失败：返回 0、窗口既不动也不置顶，还不抛异常。
-    （这个坑真踩过：浮窗怎么都摆不正，查了半天才发现是参数类型没声明。）
-    """
-    try:
-        user32 = ctypes.windll.user32
-        user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int,
-                                        ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                                        ctypes.c_uint]
-        user32.SetWindowPos.restype = wintypes.BOOL
-        user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.c_void_p]
-        user32.GetWindowRect.restype = wintypes.BOOL
-        user32.IsWindow.argtypes = [wintypes.HWND]
-        user32.IsWindow.restype = wintypes.BOOL
-        user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
-        user32.GetWindowLongW.restype = ctypes.c_long
-        user32.PostMessageW.argtypes = [wintypes.HWND, ctypes.c_uint,
-                                        ctypes.c_void_p, ctypes.c_void_p]
-        user32.PostMessageW.restype = wintypes.BOOL
-    except (AttributeError, OSError):
-        pass  # 非 Windows 就算了，用到这些函数的地方本来也只有 Windows 才走
-
-
-_declare_win32()
-
-
 class _RECT(ctypes.Structure):
     _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
                 ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
 
 
 # --------------------------------------------------------------------------- #
-# 抖音浮窗（双击宠物打开）
-# --------------------------------------------------------------------------- #
-DOUYIN_URL = "https://www.douyin.com/"
-DOUYIN_SIZE = (460, 820)  # 竖屏比例，接近手机
-DOUYIN_TITLE_HINTS = ("douyin.com", "抖音")
-
-
-def find_browser() -> str | None:
-    """找一个 Chromium 内核浏览器——要用它的 app 模式开无边框窗口。"""
-    for name in ("msedge", "chrome", "brave"):
-        found = shutil.which(name)
-        if found:
-            return found
-    for path in (
-        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-    ):
-        if Path(path).is_file():
-            return path
-    return None
-
-
-def chromium_windows() -> dict[int, tuple[int, int, int, int, str]]:
-    """当前所有 Chromium 顶层窗口：hwnd -> (左, 上, 宽, 高, 标题)。"""
-    out: dict[int, tuple[int, int, int, int, str]] = {}
-    user32 = ctypes.windll.user32
-    callback = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
-
-    def visit(hwnd, _param):
-        name = ctypes.create_unicode_buffer(64)
-        user32.GetClassNameW(hwnd, name, 64)
-        if name.value == "Chrome_WidgetWin_1" and user32.IsWindowVisible(hwnd):
-            rect = _RECT()
-            user32.GetWindowRect(hwnd, ctypes.byref(rect))
-            title = ctypes.create_unicode_buffer(256)
-            user32.GetWindowTextW(hwnd, title, 256)
-            out[hwnd] = (rect.left, rect.top, rect.right - rect.left,
-                         rect.bottom - rect.top, title.value)
-        return True
-
-    user32.EnumWindows(callback(visit), 0)
-    return out
-
-
-def rects_overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
-    ax, ay, aw, ah = a
-    bx, by, bw, bh = b
-    return ax < bx + bw and bx < ax + aw and ay < by + bh and by < ay + ah
-
-
-class DouyinWindow:
-    """双击宠物打开的抖音浮窗。
-
-    不想内嵌浏览器（tkinter 没有浏览器内核，装 WebView2 之类又多一个依赖），
-    改用 Edge/Chrome 的 app 模式开一个无边框窗口，再用 Win32 自己设尺寸、
-    位置和最前。**不能指望启动参数**——实测浏览器已经在跑的时候
-    `--window-size` / `--window-position` 会被忽略（新窗口交给已有进程创建），
-    所以必须自己 SetWindowPos。
-    """
-
-    SETTLE_S = 20.0  # 等窗口出现的最长时间
-    WM_CLOSE = 0x0010
-
-    def __init__(self):
-        self.hwnd: int | None = None
-
-    @property
-    def open(self) -> bool:
-        return bool(self.hwnd) and bool(ctypes.windll.user32.IsWindow(self.hwnd))
-
-    def toggle(self, rect: tuple[int, int, int, int]) -> str:
-        if self.open:
-            self.close()
-            return "抖音浮窗收起来了"
-        return self._open(rect)
-
-    def close(self) -> None:
-        if self.open:
-            ctypes.windll.user32.PostMessageW(self.hwnd, self.WM_CLOSE, 0, 0)
-        self.hwnd = None
-
-    def _open(self, rect: tuple[int, int, int, int]) -> str:
-        exe = find_browser()
-        if not exe:
-            return "没找到 Edge 或 Chrome，开不了浮窗"
-        before = chromium_windows()
-        try:
-            subprocess.Popen(
-                [exe, f"--app={DOUYIN_URL}", "--no-first-run", "--no-default-browser-check"],
-                close_fds=True,
-            )
-        except OSError as exc:
-            return f"启动浏览器失败：{exc}"
-
-        hwnd = self._wait_for_new(before)
-        if not hwnd:
-            return "浮窗没等到，浏览器起来了吗？"
-        self.hwnd = hwnd
-        return self._place(hwnd, rect)
-
-    def _place(self, hwnd: int, rect: tuple[int, int, int, int]) -> str:
-        """把窗口摆到指定位置并钉在最前。
-
-        刚探测到窗口时它还在初始化——Edge 随后会拿自己记忆的尺寸再覆盖一次，
-        所以必须"设一次、验一次、不对再设"，只调一次会被吃掉。
-        """
-        user32 = ctypes.windll.user32
-        x, y, w, h = rect
-        HWND_TOPMOST, SWP_NOACTIVATE, WS_EX_TOPMOST = -1, 0x0010, 0x0008
-        deadline = time.monotonic() + 4.0
-        while time.monotonic() < deadline:
-            user32.SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE)
-            time.sleep(0.25)
-            got = _RECT()
-            user32.GetWindowRect(hwnd, ctypes.byref(got))
-            style = user32.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE
-            if (got.left, got.top, got.right - got.left, got.bottom - got.top) == (x, y, w, h) \
-                    and style & WS_EX_TOPMOST:
-                return "抖音浮窗来了（再双击宠物收起来）"
-        return "浮窗开了，但没摆正位置"
-
-    def _wait_for_new(self, before: dict) -> int | None:
-        """等那个新窗口出现。
-
-        只认"启动前不存在"的窗口，这样绝不会误伤用户自己开着的浏览器。
-        标题像抖音的直接认；标题认不出来时，如果这段时间只多出一个窗口，
-        那也只能是它。
-        """
-        deadline = time.monotonic() + self.SETTLE_S
-        seen: set[int] = set()
-        while time.monotonic() < deadline:
-            time.sleep(0.3)
-            new = {h: info for h, info in chromium_windows().items() if h not in before}
-            seen |= set(new)
-            for hwnd, info in new.items():
-                title = info[4].lower()
-                if any(hint in title for hint in DOUYIN_TITLE_HINTS):
-                    return hwnd
-        return seen.pop() if len(seen) == 1 else None
-
-
 def list_monitors() -> list[tuple[int, int, int, int]]:
     """所有显示器的 (左, 上, 右, 下)；拿不到就返回空表。
 
@@ -1056,7 +879,6 @@ class Pet:
         self.topmost = bool(cfg.get("topmost", True))
         self.show_bubbles = bool(cfg.get("bubbles", True))
         self.show_speed = bool(cfg.get("speed", True))
-        self.douyin = DouyinWindow()
         self.port = cfg.get("port")
 
         self._raw, self.cell_w, self.cell_h = load_frames(sheet_path)
@@ -1154,7 +976,7 @@ class Pet:
         self.canvas.bind("<ButtonPress-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_motion)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
-        self.canvas.bind("<Double-Button-1>", self._on_double_click)
+        self.canvas.bind("<Double-Button-1>", lambda e: self.set_state("jumping", 1500))
         self.canvas.bind("<Button-3>", self._on_menu)
 
     def _build_photos(self) -> None:
@@ -1189,7 +1011,6 @@ class Pet:
         self.menu.add_checkbutton(label="总在最前", variable=self.var_top, command=self._toggle_top)
         self.menu.add_checkbutton(label="显示气泡", variable=self.var_bub, command=self._toggle_bubbles)
         self.menu.add_checkbutton(label="显示速度", variable=self.var_speed, command=self._toggle_speed)
-        self.menu.add_command(label="抖音浮窗", command=self.toggle_douyin)
         self.menu.add_separator()
         self.menu.add_command(label="退出", command=self.quit)
         self._style_menu(self.menu)
@@ -1509,30 +1330,9 @@ class Pet:
             pass
 
     def quit(self) -> None:
-        self.douyin.close()  # 浮窗是我们开出来的，走的时候一起收掉
         self._save_now()
         self.root.destroy()
 
-    # -- 抖音浮窗 ---------------------------------------------------------- #
-    def _douyin_rect(self) -> tuple[int, int, int, int]:
-        """浮窗放哪儿：主屏右侧贴底；要是会压住宠物就往左让开。"""
-        w, h = DOUYIN_SIZE
-        screen_w = self.root.winfo_screenwidth()
-        screen_h = self.root.winfo_screenheight()
-        x = max(0, screen_w - w - 24)
-        y = max(0, screen_h - h - 96)
-        pet = (self.root.winfo_x(), self.root.winfo_y(), self.win_w, self.win_h)
-        if rects_overlap((x, y, w, h), pet):
-            x = max(0, pet[0] - w - 16)
-        return x, y, w, h
-
-    def toggle_douyin(self) -> None:
-        self.say(self.douyin.toggle(self._douyin_rect()), 4)
-
-    def _on_double_click(self, _event) -> None:
-        """双击：跳一下 + 开/收抖音浮窗。"""
-        self.set_state("jumping", 1500)
-        self.toggle_douyin()
 
 
 def cfg_get(key, default):
