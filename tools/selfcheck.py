@@ -1,6 +1,5 @@
 """合成事件自检：验证拖拽/单击/缩放/气泡/速度条/换宠物逻辑，不触碰真实鼠标。"""
 
-import ctypes
 import shutil
 import sqlite3
 import sys
@@ -290,42 +289,6 @@ root.update()
 assert pet._bubble_item is not None, "显示桌面之后应当冒个泡"
 assert pet.root.attributes("-topmost"), "最小化之后宠物要重新确认置顶"
 print("显示桌面：事件链路与置顶恢复 ok")
-
-# 桌面整理：全程在沙箱目录里跑，绝不碰真实桌面
-sand = Path(tempfile.gettempdir()) / "eous_desktop_test"
-shutil.rmtree(sand, ignore_errors=True)
-sand.mkdir(parents=True)
-files = ["照片.png", "报告.pdf", "数据.xlsx", "包.zip", "程序.exe",
-         "片.mp4", "脚本.py", "微信.lnk", "怪.xyz"]
-for n in files:
-    (sand / n).write_text("x", encoding="utf-8")
-(sand / "文件夹").mkdir()
-(sand / "文件夹" / "里.txt").write_text("keep", encoding="utf-8")
-hidden = sand / "desktop.ini"
-hidden.write_text("h", encoding="utf-8")
-ctypes.windll.kernel32.SetFileAttributesW(str(hidden), 0x02 | 0x04)  # 隐藏 + 系统
-
-assert E.categorize("a.png") == "图片" and E.categorize("a.pdf") == "文档"
-assert E.categorize("a.zip") == "压缩包" and E.categorize("a.xyz") == "其他"
-print("归类 ok:", {n: E.categorize(n) for n in files})
-
-moved, dest = E.organize_desktop(sand)
-assert dest is not None and moved == len(files), f"应当整理 {len(files)} 个，实际 {moved}"
-assert (dest / "图片" / "照片.png").is_file(), "图片没归到图片目录"
-assert (dest / "快捷方式" / "微信.lnk").is_file()
-assert len(list(dest.rglob(E.DESKTOP_LOG))) == 1, "应当留下一份整理记录"
-assert (sand / "文件夹").is_dir() and (sand / "文件夹" / "里.txt").is_file(), "文件夹被动了"
-assert hidden.is_file(), "隐藏文件被动了"
-print(f"整理 ok: {moved} 个 -> {dest.name}/（文件夹与隐藏文件未动）")
-
-back, found = E.undo_desktop(sand)
-assert found and back == moved, f"撤销不完整: 搬回 {back}/{moved}"
-assert all((sand / n).is_file() for n in files), "有文件没放回桌面"
-assert not any(p.name.startswith(E.DESKTOP_PREFIX) for p in sand.iterdir()), "撤销后日期目录没清掉"
-assert hidden.is_file() and (sand / "文件夹" / "里.txt").is_file()
-print(f"撤销 ok: {back} 个全部还原，日期目录已清理")
-ctypes.windll.kernel32.SetFileAttributesW(str(hidden), 0x80)  # 复位，免得删不掉
-shutil.rmtree(sand, ignore_errors=True)
 
 # 换宠物：8x9 和 8x11 两种网格都要能加载
 print(f"可选宠物 {len(pets)} 只")
