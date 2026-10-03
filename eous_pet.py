@@ -23,6 +23,7 @@ import os
 import queue
 import random
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -191,6 +192,25 @@ class _RECT(ctypes.Structure):
 
 
 # --------------------------------------------------------------------------- #
+def minimize_all_windows() -> bool:
+    """把所有窗口最小化，等于点任务栏最右边的「显示桌面」。
+
+    走 Shell.Application 的 MinimizeAll（官方接口）。绕一道 PowerShell 是为了
+    不引入 pywin32 依赖，代价是 ~0.4 秒——所以调用方把它放后台线程，
+    免得这 0.4 秒卡在界面线程上。
+    """
+    try:
+        done = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
+             "-Command", "(New-Object -ComObject Shell.Application).MinimizeAll()"],
+            creationflags=0x08000000,  # CREATE_NO_WINDOW：别闪一个黑框
+            capture_output=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0
+
+
 def list_monitors() -> list[tuple[int, int, int, int]]:
     """所有显示器的 (左, 上, 右, 下)；拿不到就返回空表。
 
@@ -976,7 +996,7 @@ class Pet:
         self.canvas.bind("<ButtonPress-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_motion)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
-        self.canvas.bind("<Double-Button-1>", lambda e: self.set_state("jumping", 1500))
+        self.canvas.bind("<Double-Button-1>", self._on_double_click)
         self.canvas.bind("<Button-3>", self._on_menu)
 
     def _build_photos(self) -> None:
@@ -1277,6 +1297,8 @@ class Pet:
                     pass
             elif kind == "bubble":
                 self.say(str(value), extra or 4.0)
+            elif kind == "desktop":
+                self._after_show_desktop(value == "ok")
             elif kind == "quit":
                 self.quit()
 
@@ -1328,6 +1350,35 @@ class Pet:
             CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
         except OSError:
             pass
+
+    # -- 显示桌面 ---------------------------------------------------------- #
+    def _on_double_click(self, _event) -> None:
+        """双击：跳一下 + 把所有窗口最小化（等于「显示桌面」）。
+
+        最小化要起一个 PowerShell，约 0.4 秒，所以丢到后台线程去，
+        别把这 0.4 秒卡在界面线程上；回来再由主线程冒泡。
+        """
+        self.set_state("jumping", 1500)
+        threading.Thread(target=self._minimize_worker, daemon=True).start()
+
+    def _minimize_worker(self) -> None:
+        ok = minimize_all_windows()
+        self.events.put(("desktop", "ok" if ok else "fail", 0))
+
+    def _after_show_desktop(self, ok: bool) -> None:
+        """最小化之后把宠物自己放回桌面。
+
+        实测 `MinimizeAll` 不会动宠物（它是 overrideredirect 的弹出窗口，Shell 会跳过），
+        但这里还是保险地把它拉回前台并恢复置顶——万一某个系统版本把它也收走了，
+        它就再也点不着了。
+
+        成功时不冒泡：桌面已经被收干净了，那一眼就看得见，不用再说一句。
+        失败才吭一声，否则静默失效最难查。
+        """
+        self.root.deiconify()
+        self.root.attributes("-topmost", self.topmost)
+        if not ok:
+            self.say("最小化没成功…", 4)
 
     def quit(self) -> None:
         self._save_now()

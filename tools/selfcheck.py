@@ -277,6 +277,22 @@ print("手动关掉显示速度 -> 无论是否在跑都隐藏:", pet._stats_ite
 assert pet._stats_item is None
 pet.show_speed = True
 
+# 双击显示桌面：只测事件链路，不真去最小化你的窗口
+# （MinimizeAll 是全局操作，放进自检会把整张桌面清掉）
+assert hasattr(E, "minimize_all_windows"), "minimize_all_windows 不见了"
+assert callable(getattr(E.Pet, "_on_double_click", None)), "双击没接到处理函数"
+src_pet = __import__("inspect").getsource(E.Pet._on_double_click)
+assert "Thread" in src_pet, "最小化应当放后台线程，别卡住界面"
+pet._hide_bubble()
+pet._after_show_desktop(True)
+root.update()
+assert pet._bubble_item is None, "成功时不该冒泡（桌面收干净了一眼就看得见）"
+assert pet.root.attributes("-topmost"), "最小化之后宠物要重新确认置顶"
+pet._after_show_desktop(False)
+root.update()
+assert pet._bubble_item is not None, "失败时必须说一声，否则静默失效最难查"
+print("显示桌面：成功不冒泡 / 失败有提示 / 置顶恢复 ok")
+
 # 换宠物：8x9 和 8x11 两种网格都要能加载
 print(f"可选宠物 {len(pets)} 只")
 accents = {}
