@@ -9,7 +9,6 @@ waving / jumping / failed / review / waiting。
 
 运行时会在 127.0.0.1:7777 上开一个本地 HTTP 服务，协议与 Petdex 桌面端一致：
     POST /state   {"state": "running", "duration": 3000}
-    POST /bubble  {"text": "正在读文件", "busy": true}
     GET  /health
 所以任何 petdex 风格的 agent 钩子都能直接驱动这只宠物。
 """
@@ -78,7 +77,6 @@ CHATTER = [
     "今天也要加油！",
     "要不要休息一下？",
 ]
-FAIL_LINES = ["出错了…", "这个我搞不定 >_<"]
 DONE_LINES = ["搞定！", "完成啦！"]
 
 AMBIENT_STATES = ["waving", "review", "jumping", "running"]
@@ -149,42 +147,8 @@ MENU_FONT = ("Microsoft YaHei UI", 10)
 SPEED_POLL_S = 1.0
 SPEED_HISTORY = 8  # 保留最近几次调用，用来算平均速度
 
-# 「任务跑完了」的判定：turn_usage 里冒出一条刚结束的记录
-FRESH_MS = 120_000  # 只对两分钟内完成的轮次冒泡，免得启动时把历史记录当新闻播一遍
-DONE_TTL_S = 20.0  # 完成提醒的气泡停留时间，要够看清三行字
 ACCENT = (255, 138, 32)
 
-
-
-def fmt_duration(ms: float) -> str:
-    """把毫秒说成人话：23 秒 / 3 分 12 秒 / 1 小时 5 分。"""
-    total = max(0, round(ms / 1000))
-    if total < 60:
-        return f"{total} 秒"
-    minutes, seconds = divmod(total, 60)
-    if minutes < 60:
-        return f"{minutes} 分 {seconds} 秒" if seconds else f"{minutes} 分"
-    hours, minutes = divmod(minutes, 60)
-    return f"{hours} 小时 {minutes} 分" if minutes else f"{hours} 小时"
-
-
-def turn_message(turn: dict) -> str:
-    """把一轮的收尾说成三行短句。
-
-    拆成短行而不是用 · 连成长串：气泡宽度被宠物宽度卡着（小档才 144px），
-    长行会被折得断断续续，反而每行短一点更清楚。
-
-    另外别用 ✓ ✧ ☕ 这类符号：微软雅黑没有这些字形，会渲染成方框。
-    字体里确实有的常用符号是 √ ★ ☆ ● ○ ◆ →。
-    """
-    lines = ["任务出错了 >_<" if turn["status"] == "error" else "任务完成 √"]
-    lines.append(f"用时 {fmt_duration(turn['duration_ms'])}")
-    if turn["tool_call_count"]:
-        tail = f"{turn['tool_call_count']} 次工具调用"
-        if turn["tool_error_count"]:
-            tail += f"（{turn['tool_error_count']} 次出错）"
-        lines.append(tail)
-    return "\n".join(lines)
 
 
 def enable_dpi_awareness() -> float:
@@ -388,99 +352,8 @@ def load_font(px: int) -> ImageFont.FreeTypeFont:
     return ImageFont.load_default()
 
 
-def wrap_text(text: str, font: ImageFont.FreeTypeFont, max_w: int, draw: ImageDraw.ImageDraw) -> list[str]:
-    """按字符宽度折行，兼容中文（没有空格可断）。"""
-    lines, cur = [], ""
-    for ch in text:
-        if ch == "\n":
-            lines.append(cur)
-            cur = ""
-            continue
-        probe = cur + ch
-        if draw.textlength(probe, font=font) > max_w and cur:
-            lines.append(cur)
-            cur = ch
-        else:
-            cur = probe
-    if cur:
-        lines.append(cur)
-    return lines or [""]
-
-
-def bubble_metrics(scale: float) -> tuple[int, int, int, int]:
-    """气泡的（字号、行间距、内边距、尾巴高度），单位是物理像素。
-
-    字号有下限：不给下限的话「小」档只有 11px，完成提醒那种两三行的气泡
-    根本看不清。渲染和占位共用这一份，免得两边算法不一致把文字裁掉。
-    """
-    return (
-        max(int(round(13 * scale)), int(round(10.5 * DPI_SCALE))),
-        max(2, int(round(4 * scale))),
-        max(4, int(round(8 * scale))),
-        max(3, int(round(6 * scale))),
-    )
-
-
-def bubble_height(scale: float, lines: int = 3) -> int:
-    """气泡区要留多高——按最常见的三行算，再矮就放不下提醒文案了。"""
-    font_px, line_gap, pad, tail = bubble_metrics(scale)
-    return max(int(round(74 * scale)), lines * (font_px + line_gap) + pad * 2 + tail)
-
-
-def render_bubble(text: str, box_w: int, box_h: int, scale: float) -> Image.Image:
-    """在 box_w x box_h 的画布底部画一个圆角对话气泡（尾巴朝下）。"""
-    ss = 3  # 超采样，让圆角更顺
-    font_px, line_gap, pad, tail_h = bubble_metrics(scale)
-    font = load_font(font_px * ss)
-    pad *= ss
-    line_gap *= ss
-    tail_h *= ss
-    radius = max(2, int(round(9 * scale))) * ss
-    border = max(1, int(round(1.2 * scale * ss)))
-
-    canvas = Image.new("RGBA", (box_w * ss, box_h * ss), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(canvas)
-
-    max_text_w = box_w * ss - pad * 2 - 4
-    lines = wrap_text(text, font, max_text_w, draw)
-    line_h = font.size + line_gap
-    text_w = max(draw.textlength(ln, font=font) for ln in lines)
-    bubble_w = int(min(box_w * ss - 2, text_w + pad * 2))
-    bubble_h = line_h * len(lines) + pad * 2
-
-    x0 = (box_w * ss - bubble_w) // 2
-    y1 = box_h * ss - tail_h
-    y0 = y1 - bubble_h
-
-    draw.rounded_rectangle(
-        (x0, y0, x0 + bubble_w, y1),
-        radius=radius,
-        fill=(255, 255, 255, 246),
-        outline=(70, 62, 58, 255),
-        width=border,
-    )
-    # 小尾巴
-    cx = box_w * ss // 2
-    tw = int(5 * scale * ss)
-    draw.polygon(
-        [(cx - tw, y1 - 1), (cx + tw, y1 - 1), (cx, y1 + tail_h)],
-        fill=(255, 255, 255, 246),
-    )
-    draw.line([(cx - tw, y1), (cx + tw, y1)], fill=(255, 255, 255, 246), width=border)
-
-    for i, line in enumerate(lines):
-        draw.text(
-            (x0 + pad, y0 + pad + i * line_h),
-            line,
-            font=font,
-            fill=(38, 34, 32, 255),
-        )
-
-    return canvas.resize((box_w, box_h), Image.LANCZOS)
-
-
 # --------------------------------------------------------------------------- #
-# 本地 HTTP 桥：兼容 petdex 的 /state 与 /bubble
+# 本地 HTTP 桥：兼容 petdex 的 /state（驱动动画状态）
 # --------------------------------------------------------------------------- #
 class Bridge(BaseHTTPRequestHandler):
     pet: "Pet | None" = None
@@ -571,10 +444,6 @@ class Bridge(BaseHTTPRequestHandler):
                 return
             self.pet.events.put(("state", state, float(data.get("duration") or 0)))
             self._reply(200, {"ok": True, "state": state})
-        elif route == "/bubble":
-            text = str(data.get("text") or "")
-            self.pet.events.put(("bubble", text, float(data.get("ttl") or 0)))
-            self._reply(200, {"ok": True})
         elif route == "/quit":
             self.pet.events.put(("quit", None, 0))
             self._reply(200, {"ok": True})
@@ -741,21 +610,11 @@ class TurnWatcher(threading.Thread):
         self._lock = threading.Lock()
         self._last_write_ms = 0
         self._last_completed_ms = 0
-        self._seen: dict[tuple[str, str], str] = {}  # (会话, 轮次) -> 上次看到的状态
-        self._pending: list[dict] = []  # 刚结束、等着冒泡的轮次
-        self._primed = False  # 第一次轮询只登记不冒泡
         self.error: str | None = None
         self._stop = threading.Event()
 
     def stop(self) -> None:
         self._stop.set()
-
-    def pop_pending(self) -> list[dict]:
-        """取走"刚跑完的轮次"，主线程拿去冒泡。"""
-        with self._lock:
-            out = self._pending
-            self._pending = []
-        return out
 
     def is_active(self) -> bool:
         """此刻是否有一个任务在跑。"""
@@ -783,8 +642,7 @@ class TurnWatcher(threading.Thread):
         con.row_factory = sqlite3.Row
         try:
             row = con.execute(
-                "select session_id, turn_id, status, started_at, completed_at, duration_ms,"
-                " tool_call_count, tool_error_count from turn_usage order by rowid desc limit 1"
+                "select status, completed_at from turn_usage order by rowid desc limit 1"
             ).fetchone()
             try:
                 write_row = con.execute(
@@ -799,7 +657,6 @@ class TurnWatcher(threading.Thread):
         write_ms = (write_row["m"] or 0) if write_row else 0
         completed = (row["completed_at"] or 0) if row else 0
         ended = bool(row) and row["status"] in ("completed", "error", "cancelled")
-        now_ms = int(time.time() * 1000)
 
         with self._lock:
             if write_ms:
@@ -807,35 +664,6 @@ class TurnWatcher(threading.Thread):
             if ended and completed:
                 # 一轮结束了（取消也算）——速度条据此立刻收起
                 self._last_completed_ms = max(self._last_completed_ms, completed)
-
-            if not row:
-                return
-            key = (row["session_id"], row["turn_id"])
-            previous = self._seen.get(key)
-            self._seen[key] = row["status"]
-            if len(self._seen) > 200:
-                for old in list(self._seen)[:-100]:
-                    del self._seen[old]
-
-            # 启动后第一次轮询只登记：否则一开宠物就把上次已经提醒过的任务又播一遍
-            if not self._primed:
-                self._primed = True
-                return
-            if row["status"] not in ("completed", "error"):
-                return  # 还在跑；取消是用户自己按的，不用提醒
-            if previous is None:
-                # 第一次见到这一轮就提醒，但必须是刚结束的，免得补播很久以前的旧账
-                if not (completed and now_ms - completed < FRESH_MS):
-                    return
-            elif previous in ("completed", "error", "cancelled"):
-                return  # 状态没变过，别重复提醒
-
-            self._pending.append({
-                "status": row["status"],
-                "duration_ms": row["duration_ms"] or 0,
-                "tool_call_count": row["tool_call_count"] or 0,
-                "tool_error_count": row["tool_error_count"] or 0,
-            })
 
 
 def _vivid(rgb: tuple[float, float, float]) -> tuple[int, int, int]:
@@ -961,9 +789,7 @@ class Pet:
         self.user_scale = float(cfg.get("scale", DEFAULT_SCALE))
         self.scale = self.user_scale * DPI_SCALE
         self.topmost = bool(cfg.get("topmost", True))
-        self.show_bubbles = bool(cfg.get("bubbles", True))
         self.show_speed = bool(cfg.get("speed", True))
-        self.notify_done = bool(cfg.get("notify_done", True))
         self.port = cfg.get("port")
 
         self._raw, self.cell_w, self.cell_h = load_frames(sheet_path)
@@ -977,10 +803,8 @@ class Pet:
         self._frame_i = 0
         self._frame_t0 = time.monotonic()
         self._state_until: float | None = None
-        self._bubble_until: float | None = None
         self._next_ambient = time.monotonic() + random.uniform(20, 55)
         self._drag: dict | None = None
-        self._bubble_photo: ImageTk.PhotoImage | None = None
         self._stats_photo: ImageTk.PhotoImage | None = None
         self._stats_item = None
         self._stats_key = None
@@ -1017,11 +841,11 @@ class Pet:
 
     def _build_window(self) -> None:
         sw, sh = self._sprite_size()
-        self.bubble_h = bubble_height(self.scale) if self.show_bubbles else 0
         # 状态条给小尺寸留一个可读的字号下限，不然「小」档会糊成一团；
         row_h = max(int(round(28 * self.scale)), int(round(17 * DPI_SCALE)))
         self.stats_h = row_h if self.show_speed else 0
-        self.win_w, self.win_h = sw, self.bubble_h + sh + self.stats_h
+        # 不做冒泡，所以窗口就是精灵图 + 状态条，上面不再预留空间
+        self.win_w, self.win_h = sw, sh + self.stats_h
 
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", self.topmost)
@@ -1052,9 +876,8 @@ class Pet:
         self.canvas.pack(fill="both", expand=True)
 
         self._build_photos()
-        self._bubble_item = None
         self._sprite_item = self.canvas.create_image(
-            0, self.bubble_h, anchor="nw", image=self._photos[self.state][0]
+            0, 0, anchor="nw", image=self._photos[self.state][0]
         )
         self._rebuild_stats()
 
@@ -1091,13 +914,9 @@ class Pet:
         self.menu.add_separator()
 
         self.var_top = tk.BooleanVar(value=self.topmost)
-        self.var_bub = tk.BooleanVar(value=self.show_bubbles)
         self.var_speed = tk.BooleanVar(value=self.show_speed)
-        self.var_done = tk.BooleanVar(value=self.notify_done)
         self.menu.add_checkbutton(label="总在最前", variable=self.var_top, command=self._toggle_top)
-        self.menu.add_checkbutton(label="显示气泡", variable=self.var_bub, command=self._toggle_bubbles)
         self.menu.add_checkbutton(label="显示速度", variable=self.var_speed, command=self._toggle_speed)
-        self.menu.add_checkbutton(label="完成提醒", variable=self.var_done, command=self._toggle_done)
         self.menu.add_separator()
         self.menu.add_command(label="退出", command=self.quit)
         self._style_menu(self.menu)
@@ -1151,20 +970,9 @@ class Pet:
         self.root.attributes("-topmost", self.topmost)
         self._save()
 
-    def _toggle_bubbles(self) -> None:
-        self.show_bubbles = bool(self.var_bub.get())
-        if not self.show_bubbles:
-            self._hide_bubble()
-        self._rebuild_geometry()
-        self._save()
-
     def _toggle_speed(self) -> None:
         self.show_speed = bool(self.var_speed.get())
         self._rebuild_geometry()
-        self._save()
-
-    def _toggle_done(self) -> None:
-        self.notify_done = bool(self.var_done.get())
         self._save()
 
     # -- 布局 -------------------------------------------------------------- #
@@ -1175,7 +983,7 @@ class Pet:
         x, y = self._clamp(x, y)
         self.canvas.configure(width=self.win_w, height=self.win_h)
         self.root.geometry(f"{self.win_w}x{self.win_h}+{x}+{y}")
-        self.canvas.coords(self._sprite_item, 0, self.bubble_h)
+        self.canvas.coords(self._sprite_item, 0, 0)
         self._stats_key = None  # 尺寸变了，状态条必须重画
         self._rebuild_stats()
 
@@ -1187,7 +995,6 @@ class Pet:
         try:
             raw, cw, ch = load_frames(self.pets[name])
         except (SystemExit, OSError) as exc:
-            self.say(f"这只换不了：{exc}", 6)
             self.var_pet.set(self.pet_name)
             return
 
@@ -1203,7 +1010,6 @@ class Pet:
         self._state_until = None
         self._frame_i = 0
         self._frame_t0 = time.monotonic()
-        self._hide_bubble()
         self._rebuild_geometry()
         self._apply_state_visual()
         self._save()
@@ -1241,7 +1047,7 @@ class Pet:
             self.set_state(d["prev"] if d["prev"] != "running" else "idle", 0)
             self._save()
         else:
-            # 单击：蹭一下（反应按宠物性格来）；也不说话——冒泡只留给任务完成
+            # 单击：蹭一下（反应按宠物性格来）；这个版本不做冒泡，所以不说话
             pool = [s for s in self.profile["click"] if s in self._photos] or ["waving"]
             self.set_state(random.choice(pool), 1600)
 
@@ -1262,24 +1068,6 @@ class Pet:
         frames = self._photos.get(self.state) or self._photos["idle"]
         self._frame_i %= len(frames)
         self.canvas.itemconfig(self._sprite_item, image=frames[self._frame_i])
-
-    def say(self, text: str, ttl_s: float = 4.0) -> None:
-        if not self.show_bubbles or not text:
-            return
-        img = render_bubble(text, self.win_w, self.bubble_h, self.scale)
-        self._bubble_photo = ImageTk.PhotoImage(composite_on_key(img, img.size))
-        if self._bubble_item is None:
-            self._bubble_item = self.canvas.create_image(0, 0, anchor="nw", image=self._bubble_photo)
-        else:
-            self.canvas.itemconfig(self._bubble_item, image=self._bubble_photo)
-        self._bubble_until = time.monotonic() + ttl_s if ttl_s > 0 else None
-
-    def _hide_bubble(self) -> None:
-        if self._bubble_item is not None:
-            self.canvas.delete(self._bubble_item)
-            self._bubble_item = None
-        self._bubble_photo = None
-        self._bubble_until = None
 
     # -- 速度状态条 -------------------------------------------------------- #
     def _paint(self, item, img: Image.Image | None, y: int):
@@ -1312,7 +1100,7 @@ class Pet:
 
     def _rebuild_stats(self) -> None:
         """重画速度条；数值没变就直接返回，避免无谓地新建 PhotoImage。"""
-        y = self.bubble_h + self._sprite_size()[1]
+        y = self._sprite_size()[1]
 
         if not self._strip_visible() or self.stats_h <= 0:
             if self._stats_item is not None:
@@ -1346,37 +1134,13 @@ class Pet:
     def _ambient(self, now: float) -> None:
         """发呆时随机做个小动作。
 
-        只动，不说话——冒泡留给"任务跑完"（见 _drain_turns）。所以
-        PET_PROFILES 里的 chatter 现在是用不上的数据，留着是为了随时能开回来。
+        只动，不说话——这个版本不做冒泡了。所以 PET_PROFILES 里的 chatter
+        是用不上的数据，留着是为了以后想开回来时不用重写。
         """
         self._next_ambient = now + random.uniform(22, 60)
         if self.state != "idle" or self._drag:
             return
         self.set_state(random.choice(self._ambient_pool()), random.uniform(2.5, 4.5) * 1000)
-
-    def _drain_turns(self) -> None:
-        """任务跑完就冒泡——这是宠物唯一会主动说话的时候。"""
-        if not self.turn_watcher:
-            return
-        pending = self.turn_watcher.pop_pending()
-        if not self.notify_done:
-            return  # 关掉提醒时也要排空队列，免得开启后补播旧消息
-        for turn in pending:
-            self.set_state("waving", 2500)
-            self.say(turn_message(turn), DONE_TTL_S)
-            self._log_notify(turn)
-
-    def _log_notify(self, turn: dict) -> None:
-        """留一行记录，方便事后确认到底提醒过没有。"""
-        try:
-            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-            with (CONFIG_DIR / "notify.log").open("a", encoding="utf-8") as fh:
-                fh.write(
-                    f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{turn['status']}\t"
-                    f"{fmt_duration(turn['duration_ms'])}\t{turn['tool_call_count']} tools\n"
-                )
-        except OSError:
-            pass
 
     # -- 主循环 ------------------------------------------------------------ #
     def _drain(self, now: float) -> None:
@@ -1387,12 +1151,6 @@ class Pet:
                 return
             if kind == "state":
                 self.set_state(value, extra)
-                if value == "failed":
-                    self.say(random.choice(FAIL_LINES), 3)
-                elif value in ("waving", "jumping"):
-                    pass
-            elif kind == "bubble":
-                self.say(str(value), extra or 4.0)
             elif kind == "desktop":
                 self._after_show_desktop(value == "ok")
             elif kind == "quit":
@@ -1415,7 +1173,6 @@ class Pet:
             self.canvas.itemconfig(self._sprite_item, image=frames[self._frame_i])
 
         self._rebuild_stats()
-        self._drain_turns()
         self.root.after(30, self._tick)
 
     # -- 配置 -------------------------------------------------------------- #
@@ -1435,9 +1192,7 @@ class Pet:
             cfg["x"], cfg["y"] = self.root.winfo_x(), self.root.winfo_y()
         cfg.update(
             topmost=self.topmost,
-            bubbles=self.show_bubbles,
             speed=self.show_speed,
-            notify_done=self.notify_done,
             state=self.state,
             pet=self.pet_name,
         )
@@ -1454,7 +1209,7 @@ class Pet:
         """双击：跳一下 + 把所有窗口最小化（等于「显示桌面」）。
 
         最小化要起一个 PowerShell，约 0.4 秒，所以丢到后台线程去，
-        别把这 0.4 秒卡在界面线程上；回来再由主线程冒泡。
+        别把这 0.4 秒卡在界面线程上。
         """
         self.set_state("jumping", 1500)
         threading.Thread(target=self._minimize_worker, daemon=True).start()
@@ -1470,13 +1225,9 @@ class Pet:
         但这里还是保险地把它拉回前台并恢复置顶——万一某个系统版本把它也收走了，
         它就再也点不着了。
 
-        成功时不冒泡：桌面已经被收干净了，那一眼就看得见，不用再说一句。
-        失败才吭一声，否则静默失效最难查。
         """
         self.root.deiconify()
         self.root.attributes("-topmost", self.topmost)
-        if not ok:
-            self.say("最小化没成功…", 4)
 
     def quit(self) -> None:
         self._save_now()
@@ -1494,27 +1245,23 @@ def cfg_get(key, default):
 # --------------------------------------------------------------------------- #
 # 预览（不需要窗口，用于自检）
 # --------------------------------------------------------------------------- #
-def preview(sheet_path: Path, out: Path, state: str, text: str, scale: float,
+def preview(sheet_path: Path, out: Path, state: str, scale: float,
             stat: dict | None = None) -> None:
     frames, _, _ = load_frames(sheet_path)
     accent = dominant_color(frames["idle"])
     frames = scale_frames(frames, scale)
     sprite = frames[state][0]
     w, h = sprite.size
-    bubble_h = bubble_height(scale)
     stats_h = max(int(round(28 * scale)), int(round(17 * DPI_SCALE))) if stat else 0
-    canvas = Image.new("RGB", (w, bubble_h + h + stats_h), (24, 26, 33))
+    canvas = Image.new("RGB", (w, h + stats_h), (24, 26, 33))
 
-    if text:
-        bubble = render_bubble(text, w, bubble_h, scale)
-        canvas.paste(bubble, (0, 0), bubble)
-    canvas.paste(sprite, (0, bubble_h), sprite)
+    canvas.paste(sprite, (0, 0), sprite)
     if stats_h:
         strip = render_stats(stat, w, stats_h, DPI_SCALE, accent)
         if strip is not None:
-            canvas.paste(strip, (0, bubble_h + h), strip)
+            canvas.paste(strip, (0, h), strip)
     canvas.save(out)
-    print(f"wrote {out}  ({state}, {w}x{bubble_h + h + stats_h}, 主色 #{accent[0]:02x}{accent[1]:02x}{accent[2]:02x})")
+    print(f"wrote {out}  ({state}, {w}x{h + stats_h}, 主色 #{accent[0]:02x}{accent[1]:02x}{accent[2]:02x})")
 
 
 # --------------------------------------------------------------------------- #
@@ -1532,7 +1279,6 @@ def main() -> None:
     ap.add_argument("--no-speed", action="store_true", help="不读数据库、不显示速度")
     ap.add_argument("--preview", help="只渲染一张预览图到指定路径后退出")
     ap.add_argument("--preview-state", default="idle")
-    ap.add_argument("--preview-text", default="你好呀！")
     args = ap.parse_args()
 
     pets = discover_pets()
@@ -1559,7 +1305,7 @@ def main() -> None:
             stat = query_latest_speed(Path(args.db) if args.db else SPEED_DB)
         except (sqlite3.Error, OSError, ValueError):
             stat = None
-        preview(sheet_path, Path(args.preview), args.preview_state, args.preview_text,
+        preview(sheet_path, Path(args.preview), args.preview_state,
                 (args.scale or DEFAULT_SCALE) * DPI_SCALE, stat)
         return
 

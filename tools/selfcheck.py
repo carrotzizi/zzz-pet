@@ -1,4 +1,4 @@
-"""合成事件自检：验证拖拽/单击/缩放/气泡/速度条/换宠物逻辑，不触碰真实鼠标。"""
+"""合成事件自检：验证拖拽/单击/速度条/多屏边界/换宠物逻辑，不触碰真实鼠标。"""
 
 import shutil
 import sqlite3
@@ -34,7 +34,7 @@ root.withdraw()
 pet = E.Pet(root, sheet, {}, pets=pets, pet_name=pet_name)
 root.update()
 print("frames/state:", {k: len(v) for k, v in pet._photos.items()})
-print("window:", pet.win_w, "x", pet.win_h, "bubble_h:", pet.bubble_h, "stats_h:", pet.stats_h)
+print("window:", pet.win_w, "x", pet.win_h, "stats_h:", pet.stats_h)
 
 # 拖拽
 pet._on_press(Ev(500, 500))
@@ -89,17 +89,6 @@ pet._on_press(Ev(500, 500))
 pet._on_release(Ev(500, 500))
 print("click: state=", pet.state)
 
-# 状态与气泡
-for s in E.STATES:
-    pet.set_state(s, 0)
-    assert pet.state == s and pet._frame_i == 0
-print("all 9 states ok")
-pet.say("自检气泡")
-root.update()
-print("bubble created:", pet._bubble_item is not None, "photo:", pet._bubble_photo is not None)
-pet._hide_bubble()
-print("bubble hidden:", pet._bubble_item is None)
-
 # 尺寸固定「小」：菜单里的三档已经去掉了，set_scale 也不该再存在
 assert not hasattr(pet, "set_scale"), "尺寸应该固定，set_scale 该删掉了"
 assert pet.user_scale == E.DEFAULT_SCALE, f"尺寸不是固定的「小」: {pet.user_scale}"
@@ -133,26 +122,6 @@ root.update()
 print("after show -> stats_h:", pet.stats_h, "item drawn:", pet._stats_item is not None)
 
 watcher.stop()
-
-for ms, want in ((23_000, "23 秒"), (95_000, "1 分 35 秒"), (120_000, "2 分"),
-                 (3_900_000, "1 小时 5 分"), (7_200_000, "2 小时")):
-    got = E.fmt_duration(ms)
-    assert got == want, f"fmt_duration({ms}) = {got!r}，期望 {want!r}"
-print("fmt_duration ok")
-
-# 气泡字号下限：不加下限时「小」档只有 11px，提醒根本看不清
-saved_dpi = E.DPI_SCALE
-E.DPI_SCALE = 1.5  # 本机是 150%
-small = 0.5 * E.DPI_SCALE
-font_px, _, _, _ = E.bubble_metrics(small)
-print(f"小档（渲染缩放 {small}）气泡字号 {font_px}px，气泡区高 {E.bubble_height(small)}px")
-assert font_px >= 15, f"小档字号太小了：{font_px}px"
-assert E.bubble_height(small) >= 3 * (font_px + 2), "气泡区放不下三行"
-for scale in (0.75, 1.5, 2.25):
-    px = E.bubble_metrics(scale)[0]
-    assert 15 <= px <= 40, f"缩放 {scale} 的字号不合理：{px}"
-print("字号在不同缩放下都合理:", [E.bubble_metrics(s)[0] for s in (0.75, 1.5, 2.25)])
-E.DPI_SCALE = saved_dpi
 
 # 活动检测：速度条只在任务进行时显示
 tmp2 = Path(tempfile.gettempdir()) / "eous_activity_test.sqlite"
@@ -213,39 +182,9 @@ tw2.stop()
 tmp2.unlink(missing_ok=True)
 
 
-# 气泡里不能出现字体缺字，否则渲染成一个方框
-def missing_glyphs(text: str) -> list[str]:
-    from PIL import Image, ImageDraw
-
-    font = E.load_font(28)
-    ref = Image.new("L", (40, 40), 0)
-    ImageDraw.Draw(ref).text((2, 2), "\uffff", font=font, fill=255)
-    ref_bytes = ref.tobytes()
-    bad = []
-    for ch in text:
-        im = Image.new("L", (40, 40), 0)
-        ImageDraw.Draw(im).text((2, 2), ch, font=font, fill=255)
-        if im.tobytes() == ref_bytes:  # 和"必定缺字"的参照一模一样
-            bad.append(ch)
-    return bad
-
-
-bubble_texts = (
-    E.CHATTER
-    + E.FAIL_LINES
-    + E.DONE_LINES
-    + [p for prof in E.PET_PROFILES.values() for p in prof["chatter"]]
-    + ["专注结束 √\n已完成 3 轮\n起来活动一下吧", "休息结束\n回来继续吧"]
-)
-for text in bubble_texts:
-    bad = missing_glyphs(text)
-    assert not bad, f"气泡文案里有字体缺字 {bad!r}: {text!r}"
-print(f"气泡文案字形检查 ok（{len(bubble_texts)} 条）")
-
-
-# 完整链路：TurnWatcher 报出一轮完成 -> 宠物冒泡 + 记日志
+# 速度条只在任务进行时显示
 class FakeTurns:
-    """顶替 TurnWatcher：速度条只问它"在不在跑"。"""
+    """顶替 TurnWatcher——速度条只问它一句"在不在跑"。"""
 
     def __init__(self, active=False):
         self.active = active
@@ -254,7 +193,6 @@ class FakeTurns:
         return self.active
 
 
-# 速度条只在任务进行时显示
 pet.turn_watcher = FakeTurns(active=False)
 pet._stats_key = None
 pet._rebuild_stats()
@@ -283,103 +221,14 @@ assert hasattr(E, "minimize_all_windows"), "minimize_all_windows 不见了"
 assert callable(getattr(E.Pet, "_on_double_click", None)), "双击没接到处理函数"
 src_pet = __import__("inspect").getsource(E.Pet._on_double_click)
 assert "Thread" in src_pet, "最小化应当放后台线程，别卡住界面"
-pet._hide_bubble()
 pet._after_show_desktop(True)
 root.update()
-assert pet._bubble_item is None, "成功时不该冒泡（桌面收干净了一眼就看得见）"
 assert pet.root.attributes("-topmost"), "最小化之后宠物要重新确认置顶"
+assert not hasattr(pet, "say"), "冒泡功能已删除，不该还有 say"
 pet._after_show_desktop(False)
 root.update()
-assert pet._bubble_item is not None, "失败时必须说一声，否则静默失效最难查"
-print("显示桌面：成功不冒泡 / 失败有提示 / 置顶恢复 ok")
+print("显示桌面：置顶恢复 ok（冒泡已移除）")
 
-
-# 说话策略：只有「任务跑完」才自动冒泡，发呆和点击都闭嘴
-class FakeTurns:
-    """顶替 TurnWatcher：既能报"刚结束的轮次"，也能回答"在不在跑"。"""
-
-    def __init__(self, items=(), active=False):
-        self.items = list(items)
-        self.active = active
-
-    def pop_pending(self):
-        out, self.items = self.items, []
-        return out
-
-    def is_active(self):
-        return self.active
-
-
-saved_tw = pet.turn_watcher
-pet.turn_watcher = FakeTurns(active=False)
-
-pet._hide_bubble()
-pet._ambient(time.monotonic())
-root.update()
-assert pet._bubble_item is None, "发呆时不该冒泡（只动不说）"
-
-pet._hide_bubble()
-pet._on_press(Ev(500, 500))
-pet._on_release(Ev(500, 500))
-root.update()
-assert pet._bubble_item is None, "点击时不该冒泡"
-print("发呆与点击都不冒泡 ok（动画照常）")
-
-done = {"status": "completed", "duration_ms": 91_200, "tool_call_count": 7, "tool_error_count": 0}
-assert E.turn_message(done).count("\n") == 2, "完成提醒应当是三行短句"
-assert "任务完成" in E.turn_message(done) and "1 分 31 秒" in E.turn_message(done)
-assert "任务出错" in E.turn_message({**done, "status": "error"})
-print("完成提醒文案:", repr(E.turn_message(done)))
-
-pet.notify_done = True
-pet.turn_watcher = FakeTurns([done])
-pet._hide_bubble()
-pet._drain_turns()
-root.update()
-assert pet._bubble_item is not None, "任务跑完必须冒泡"
-assert not pet.turn_watcher.items, "冒完泡要把队列排空"
-
-pet.notify_done = False
-pet.turn_watcher = FakeTurns([done])
-pet._hide_bubble()
-pet._drain_turns()
-root.update()
-assert pet._bubble_item is None, "关掉完成提醒后不该冒泡"
-assert not pet.turn_watcher.items, "关掉提醒也要排空队列，免得开启后补播旧消息"
-pet.notify_done = True
-pet.turn_watcher = saved_tw
-print("完成提醒：开时冒泡、关时静默且排空 ok")
-
-# TurnWatcher 只对"刚结束"的轮次报事件（用临时库真造记录）
-tmp = Path(tempfile.gettempdir()) / "eous_turn_test.sqlite"
-tmp.unlink(missing_ok=True)
-con = sqlite3.connect(tmp)
-con.execute(
-    "create table turn_usage (session_id text, turn_id text, status text, started_at integer,"
-    " completed_at integer, duration_ms integer, tool_call_count integer,"
-    " tool_error_count integer)"
-)
-con.execute("insert into turn_usage values ('s1','t1','completed',?,?,5000,1,0)",
-            (int(time.time() * 1000) - 8000, int(time.time() * 1000) - 5000))
-con.commit()
-con.close()
-
-tw = E.TurnWatcher(tmp, poll_s=0.2)
-tw.start()
-time.sleep(0.7)
-assert tw.pop_pending() == [], "启动时不该把已有记录当成刚跑完"
-con = sqlite3.connect(tmp)
-con.execute("insert into turn_usage values ('s1','t2','completed',?,?,91200,7,0)",
-            (int(time.time() * 1000) - 2000, int(time.time() * 1000)))
-con.commit()
-con.close()
-time.sleep(1.2)
-got = tw.pop_pending()
-tw.stop()
-assert len(got) == 1 and got[0]["tool_call_count"] == 7, f"应当检测到刚结束的一轮，实际 {got}"
-assert tw.pop_pending() == [], "同一轮不该重复提醒"
-tmp.unlink(missing_ok=True)
-print("TurnWatcher：只报刚结束的轮次、不重复 ok")
 
 # 换宠物：8x9 和 8x11 两种网格都要能加载
 print(f"可选宠物 {len(pets)} 只")

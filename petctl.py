@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""给正在运行的 Eous 桌面宠物发指令（走本地 HTTP 桥，协议和 Petdex 一致）。
+"""给正在运行的桌面宠物发指令（走本地 HTTP 桥，协议和 Petdex 一致）。
 
     python petctl.py state running
     python petctl.py state failed --duration 4000
-    python petctl.py say "正在读文件"
     python petctl.py states
     python petctl.py health
     python petctl.py quit
@@ -64,10 +63,6 @@ def main() -> int:
     p_state.add_argument("state", choices=STATES)
     p_state.add_argument("--duration", type=float, default=0, help="保持毫秒数，0 表示一直保持")
 
-    p_say = sub.add_parser("say", help="显示对话气泡")
-    p_say.add_argument("text")
-    p_say.add_argument("--ttl", type=float, default=4.0, help="气泡停留秒数")
-
     sub.add_parser("states", help="列出可用状态")
     sub.add_parser("health", help="检查宠物是否在运行")
     sub.add_parser("quit", help="让宠物退出")
@@ -82,8 +77,6 @@ def main() -> int:
     try:
         if args.cmd == "state":
             print(post("/state", {"state": args.state, "duration": args.duration}, port))
-        elif args.cmd == "say":
-            print(post("/bubble", {"text": args.text, "ttl": args.ttl}, port))
         elif args.cmd == "health":
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=3) as resp:
                 print(resp.read().decode("utf-8"))
