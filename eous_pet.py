@@ -81,6 +81,11 @@ DONE_LINES = ["搞定！", "完成啦！"]
 
 AMBIENT_STATES = ["waving", "review", "jumping", "running"]
 
+# AI 干活时宠物也一直动：轮着播这些动作，每个停 1~2.5 秒。
+# 不放 failed——那是躺地上，看着像坏了。
+BUSY_STATES = ["waiting", "running", "review", "jumping", "running-left", "running-right"]
+BUSY_HOLD_S = (1.0, 2.5)
+
 # 每只宠物有自己的性格：聊什么、爱做什么动作、被戳了怎么反应。
 # 列表里同一个状态写多次就是提高权重。没登记的宠物用 DEFAULT_PROFILE。
 DEFAULT_PROFILE: dict[str, list[str]] = {
@@ -804,6 +809,8 @@ class Pet:
         self._frame_t0 = time.monotonic()
         self._state_until: float | None = None
         self._next_ambient = time.monotonic() + random.uniform(20, 55)
+        self._busy_until = 0.0  # 当前这个"忙"动作要播到什么时候
+        self._busy_active = False  # 上一帧 AI 是否在干活（用来判断该不该收工回 idle）
         self._drag: dict | None = None
         self._stats_photo: ImageTk.PhotoImage | None = None
         self._stats_item = None
@@ -1142,6 +1149,35 @@ class Pet:
             return
         self.set_state(random.choice(self._ambient_pool()), random.uniform(2.5, 4.5) * 1000)
 
+    def _drive_busy(self, now: float) -> None:
+        """AI 在干活时，宠物也一直有动作。
+
+        "在不在干活"直接问 TurnWatcher——它本来就在读数据库算这件事（速度条的显隐
+        也是它管的），这里不用再发明一套判断。在干活就轮着播动作，每个停 1~2.5 秒，
+        看起来像跟着一起忙；活干完了回到 idle，发呆呆的随机动作照旧。
+
+        优先级：点击/双击那种带 duration 的临时动作先播完（_state_until 没过期就
+        不抢），拖拽时也不动。
+        """
+        busy = bool(self.turn_watcher and self.turn_watcher.is_active())
+        if not busy:
+            if self._busy_active:
+                self._busy_active = False
+                if not (self._state_until and now < self._state_until):
+                    self.set_state("idle", 0)  # 收工，别停在 running 上
+            return
+
+        self._busy_active = True
+        if self._drag or now < self._busy_until:
+            return
+        if self._state_until and now < self._state_until:
+            return  # 你刚点了它，让那个反应播完
+
+        pool = [s for s in BUSY_STATES if s in self._photos]
+        others = [s for s in pool if s != self.state] or pool
+        self.set_state(random.choice(others), 0)  # 不复用 _state_until，由 _busy_until 管
+        self._busy_until = now + random.uniform(*BUSY_HOLD_S)
+
     # -- 主循环 ------------------------------------------------------------ #
     def _drain(self, now: float) -> None:
         while True:
@@ -1163,6 +1199,7 @@ class Pet:
         if self._state_until and now >= self._state_until:
             self._state_until = None
             self.set_state("idle", 0)
+        self._drive_busy(now)
         if now >= self._next_ambient:
             self._ambient(now)
 

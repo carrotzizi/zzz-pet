@@ -215,6 +215,31 @@ print("手动关掉显示速度 -> 无论是否在跑都隐藏:", pet._stats_ite
 assert pet._stats_item is None
 pet.show_speed = True
 
+# AI 干活时宠物要一直有动作（不能干坐着）
+pet.turn_watcher = FakeTurns(active=True)
+now = time.monotonic()
+states = []
+for i in range(80):
+    pet._drive_busy(now + i * 0.1)
+    states.append(pet.state)
+uniq = sorted(set(states))
+assert len(uniq) > 1, f"AI 干活时应当在轮换动作，实际一直停在 {uniq}"
+assert set(uniq) <= set(E.BUSY_STATES), f"轮播里混进了非忙动作: {set(uniq) - set(E.BUSY_STATES)}"
+assert "failed" not in uniq, "failed 是躺地上，不该出现在忙动作里"
+print(f"AI 干活时一直动 ok：8 秒内轮换 {len(uniq)} 种动作 {uniq}")
+
+pet.turn_watcher = FakeTurns(active=False)
+pet._drive_busy(time.monotonic())
+assert pet.state == "idle", f"AI 收工后应当回到 idle，实际 {pet.state}"
+
+pet.turn_watcher = FakeTurns(active=True)
+pet.set_state("jumping", 1500)  # 模拟用户点了它一下
+pet._drive_busy(time.monotonic())
+assert pet.state == "jumping", "点击的临时动作应当优先播完，别被忙动作抢走"
+pet.turn_watcher = FakeTurns(active=False)
+pet._drive_busy(time.monotonic())
+print("AI 收工回 idle / 点击反应优先 ok")
+
 # 双击显示桌面：只测事件链路，不真去最小化你的窗口
 # （MinimizeAll 是全局操作，放进自检会把整张桌面清掉）
 assert hasattr(E, "minimize_all_windows"), "minimize_all_windows 不见了"
