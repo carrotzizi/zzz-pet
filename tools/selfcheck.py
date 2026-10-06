@@ -293,6 +293,94 @@ root.update()
 assert pet._bubble_item is not None, "失败时必须说一声，否则静默失效最难查"
 print("显示桌面：成功不冒泡 / 失败有提示 / 置顶恢复 ok")
 
+
+# 说话策略：只有「任务跑完」才自动冒泡，发呆和点击都闭嘴
+class FakeTurns:
+    """顶替 TurnWatcher：既能报"刚结束的轮次"，也能回答"在不在跑"。"""
+
+    def __init__(self, items=(), active=False):
+        self.items = list(items)
+        self.active = active
+
+    def pop_pending(self):
+        out, self.items = self.items, []
+        return out
+
+    def is_active(self):
+        return self.active
+
+
+saved_tw = pet.turn_watcher
+pet.turn_watcher = FakeTurns(active=False)
+
+pet._hide_bubble()
+pet._ambient(time.monotonic())
+root.update()
+assert pet._bubble_item is None, "发呆时不该冒泡（只动不说）"
+
+pet._hide_bubble()
+pet._on_press(Ev(500, 500))
+pet._on_release(Ev(500, 500))
+root.update()
+assert pet._bubble_item is None, "点击时不该冒泡"
+print("发呆与点击都不冒泡 ok（动画照常）")
+
+done = {"status": "completed", "duration_ms": 91_200, "tool_call_count": 7, "tool_error_count": 0}
+assert E.turn_message(done).count("\n") == 2, "完成提醒应当是三行短句"
+assert "任务完成" in E.turn_message(done) and "1 分 31 秒" in E.turn_message(done)
+assert "任务出错" in E.turn_message({**done, "status": "error"})
+print("完成提醒文案:", repr(E.turn_message(done)))
+
+pet.notify_done = True
+pet.turn_watcher = FakeTurns([done])
+pet._hide_bubble()
+pet._drain_turns()
+root.update()
+assert pet._bubble_item is not None, "任务跑完必须冒泡"
+assert not pet.turn_watcher.items, "冒完泡要把队列排空"
+
+pet.notify_done = False
+pet.turn_watcher = FakeTurns([done])
+pet._hide_bubble()
+pet._drain_turns()
+root.update()
+assert pet._bubble_item is None, "关掉完成提醒后不该冒泡"
+assert not pet.turn_watcher.items, "关掉提醒也要排空队列，免得开启后补播旧消息"
+pet.notify_done = True
+pet.turn_watcher = saved_tw
+print("完成提醒：开时冒泡、关时静默且排空 ok")
+
+# TurnWatcher 只对"刚结束"的轮次报事件（用临时库真造记录）
+tmp = Path(tempfile.gettempdir()) / "eous_turn_test.sqlite"
+tmp.unlink(missing_ok=True)
+con = sqlite3.connect(tmp)
+con.execute(
+    "create table turn_usage (session_id text, turn_id text, status text, started_at integer,"
+    " completed_at integer, duration_ms integer, tool_call_count integer,"
+    " tool_error_count integer)"
+)
+con.execute("insert into turn_usage values ('s1','t1','completed',?,?,5000,1,0)",
+            (int(time.time() * 1000) - 8000, int(time.time() * 1000) - 5000))
+con.commit()
+con.close()
+
+tw = E.TurnWatcher(tmp, poll_s=0.2)
+tw.start()
+time.sleep(0.7)
+assert tw.pop_pending() == [], "启动时不该把已有记录当成刚跑完"
+con = sqlite3.connect(tmp)
+con.execute("insert into turn_usage values ('s1','t2','completed',?,?,91200,7,0)",
+            (int(time.time() * 1000) - 2000, int(time.time() * 1000)))
+con.commit()
+con.close()
+time.sleep(1.2)
+got = tw.pop_pending()
+tw.stop()
+assert len(got) == 1 and got[0]["tool_call_count"] == 7, f"应当检测到刚结束的一轮，实际 {got}"
+assert tw.pop_pending() == [], "同一轮不该重复提醒"
+tmp.unlink(missing_ok=True)
+print("TurnWatcher：只报刚结束的轮次、不重复 ok")
+
 # 换宠物：8x9 和 8x11 两种网格都要能加载
 print(f"可选宠物 {len(pets)} 只")
 accents = {}

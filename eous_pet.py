@@ -148,6 +148,10 @@ MENU_FONT = ("Microsoft YaHei UI", 10)
 
 SPEED_POLL_S = 1.0
 SPEED_HISTORY = 8  # 保留最近几次调用，用来算平均速度
+
+# 「任务跑完了」的判定：turn_usage 里冒出一条刚结束的记录
+FRESH_MS = 120_000  # 只对两分钟内完成的轮次冒泡，免得启动时把历史记录当新闻播一遍
+DONE_TTL_S = 20.0  # 完成提醒的气泡停留时间，要够看清三行字
 ACCENT = (255, 138, 32)
 
 
@@ -162,6 +166,25 @@ def fmt_duration(ms: float) -> str:
         return f"{minutes} 分 {seconds} 秒" if seconds else f"{minutes} 分"
     hours, minutes = divmod(minutes, 60)
     return f"{hours} 小时 {minutes} 分" if minutes else f"{hours} 小时"
+
+
+def turn_message(turn: dict) -> str:
+    """把一轮的收尾说成三行短句。
+
+    拆成短行而不是用 · 连成长串：气泡宽度被宠物宽度卡着（小档才 144px），
+    长行会被折得断断续续，反而每行短一点更清楚。
+
+    另外别用 ✓ ✧ ☕ 这类符号：微软雅黑没有这些字形，会渲染成方框。
+    字体里确实有的常用符号是 √ ★ ☆ ● ○ ◆ →。
+    """
+    lines = ["任务出错了 >_<" if turn["status"] == "error" else "任务完成 √"]
+    lines.append(f"用时 {fmt_duration(turn['duration_ms'])}")
+    if turn["tool_call_count"]:
+        tail = f"{turn['tool_call_count']} 次工具调用"
+        if turn["tool_error_count"]:
+            tail += f"（{turn['tool_error_count']} 次出错）"
+        lines.append(tail)
+    return "\n".join(lines)
 
 
 def enable_dpi_awareness() -> float:
@@ -718,11 +741,21 @@ class TurnWatcher(threading.Thread):
         self._lock = threading.Lock()
         self._last_write_ms = 0
         self._last_completed_ms = 0
+        self._seen: dict[tuple[str, str], str] = {}  # (会话, 轮次) -> 上次看到的状态
+        self._pending: list[dict] = []  # 刚结束、等着冒泡的轮次
+        self._primed = False  # 第一次轮询只登记不冒泡
         self.error: str | None = None
         self._stop = threading.Event()
 
     def stop(self) -> None:
         self._stop.set()
+
+    def pop_pending(self) -> list[dict]:
+        """取走"刚跑完的轮次"，主线程拿去冒泡。"""
+        with self._lock:
+            out = self._pending
+            self._pending = []
+        return out
 
     def is_active(self) -> bool:
         """此刻是否有一个任务在跑。"""
@@ -750,7 +783,8 @@ class TurnWatcher(threading.Thread):
         con.row_factory = sqlite3.Row
         try:
             row = con.execute(
-                "select status, completed_at from turn_usage order by rowid desc limit 1"
+                "select session_id, turn_id, status, started_at, completed_at, duration_ms,"
+                " tool_call_count, tool_error_count from turn_usage order by rowid desc limit 1"
             ).fetchone()
             try:
                 write_row = con.execute(
@@ -765,6 +799,7 @@ class TurnWatcher(threading.Thread):
         write_ms = (write_row["m"] or 0) if write_row else 0
         completed = (row["completed_at"] or 0) if row else 0
         ended = bool(row) and row["status"] in ("completed", "error", "cancelled")
+        now_ms = int(time.time() * 1000)
 
         with self._lock:
             if write_ms:
@@ -772,6 +807,35 @@ class TurnWatcher(threading.Thread):
             if ended and completed:
                 # 一轮结束了（取消也算）——速度条据此立刻收起
                 self._last_completed_ms = max(self._last_completed_ms, completed)
+
+            if not row:
+                return
+            key = (row["session_id"], row["turn_id"])
+            previous = self._seen.get(key)
+            self._seen[key] = row["status"]
+            if len(self._seen) > 200:
+                for old in list(self._seen)[:-100]:
+                    del self._seen[old]
+
+            # 启动后第一次轮询只登记：否则一开宠物就把上次已经提醒过的任务又播一遍
+            if not self._primed:
+                self._primed = True
+                return
+            if row["status"] not in ("completed", "error"):
+                return  # 还在跑；取消是用户自己按的，不用提醒
+            if previous is None:
+                # 第一次见到这一轮就提醒，但必须是刚结束的，免得补播很久以前的旧账
+                if not (completed and now_ms - completed < FRESH_MS):
+                    return
+            elif previous in ("completed", "error", "cancelled"):
+                return  # 状态没变过，别重复提醒
+
+            self._pending.append({
+                "status": row["status"],
+                "duration_ms": row["duration_ms"] or 0,
+                "tool_call_count": row["tool_call_count"] or 0,
+                "tool_error_count": row["tool_error_count"] or 0,
+            })
 
 
 def _vivid(rgb: tuple[float, float, float]) -> tuple[int, int, int]:
@@ -899,6 +963,7 @@ class Pet:
         self.topmost = bool(cfg.get("topmost", True))
         self.show_bubbles = bool(cfg.get("bubbles", True))
         self.show_speed = bool(cfg.get("speed", True))
+        self.notify_done = bool(cfg.get("notify_done", True))
         self.port = cfg.get("port")
 
         self._raw, self.cell_w, self.cell_h = load_frames(sheet_path)
@@ -1028,9 +1093,11 @@ class Pet:
         self.var_top = tk.BooleanVar(value=self.topmost)
         self.var_bub = tk.BooleanVar(value=self.show_bubbles)
         self.var_speed = tk.BooleanVar(value=self.show_speed)
+        self.var_done = tk.BooleanVar(value=self.notify_done)
         self.menu.add_checkbutton(label="总在最前", variable=self.var_top, command=self._toggle_top)
         self.menu.add_checkbutton(label="显示气泡", variable=self.var_bub, command=self._toggle_bubbles)
         self.menu.add_checkbutton(label="显示速度", variable=self.var_speed, command=self._toggle_speed)
+        self.menu.add_checkbutton(label="完成提醒", variable=self.var_done, command=self._toggle_done)
         self.menu.add_separator()
         self.menu.add_command(label="退出", command=self.quit)
         self._style_menu(self.menu)
@@ -1094,6 +1161,10 @@ class Pet:
     def _toggle_speed(self) -> None:
         self.show_speed = bool(self.var_speed.get())
         self._rebuild_geometry()
+        self._save()
+
+    def _toggle_done(self) -> None:
+        self.notify_done = bool(self.var_done.get())
         self._save()
 
     # -- 布局 -------------------------------------------------------------- #
@@ -1170,11 +1241,9 @@ class Pet:
             self.set_state(d["prev"] if d["prev"] != "running" else "idle", 0)
             self._save()
         else:
-            # 单击：蹭一下（反应也按宠物性格来）
+            # 单击：蹭一下（反应按宠物性格来）；也不说话——冒泡只留给任务完成
             pool = [s for s in self.profile["click"] if s in self._photos] or ["waving"]
             self.set_state(random.choice(pool), 1600)
-            if random.random() < 0.6:
-                self.say(random.choice(self.profile["chatter"]), 3)
 
     # -- 状态 -------------------------------------------------------------- #
     def set_state(self, name: str, duration_ms: float = 0) -> None:
@@ -1275,12 +1344,39 @@ class Pet:
         self.set_state(random.choice(self._ambient_pool()), 3000)
 
     def _ambient(self, now: float) -> None:
+        """发呆时随机做个小动作。
+
+        只动，不说话——冒泡留给"任务跑完"（见 _drain_turns）。所以
+        PET_PROFILES 里的 chatter 现在是用不上的数据，留着是为了随时能开回来。
+        """
         self._next_ambient = now + random.uniform(22, 60)
         if self.state != "idle" or self._drag:
             return
         self.set_state(random.choice(self._ambient_pool()), random.uniform(2.5, 4.5) * 1000)
-        if random.random() < 0.45:
-            self.say(random.choice(self.profile["chatter"]), 3.5)
+
+    def _drain_turns(self) -> None:
+        """任务跑完就冒泡——这是宠物唯一会主动说话的时候。"""
+        if not self.turn_watcher:
+            return
+        pending = self.turn_watcher.pop_pending()
+        if not self.notify_done:
+            return  # 关掉提醒时也要排空队列，免得开启后补播旧消息
+        for turn in pending:
+            self.set_state("waving", 2500)
+            self.say(turn_message(turn), DONE_TTL_S)
+            self._log_notify(turn)
+
+    def _log_notify(self, turn: dict) -> None:
+        """留一行记录，方便事后确认到底提醒过没有。"""
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            with (CONFIG_DIR / "notify.log").open("a", encoding="utf-8") as fh:
+                fh.write(
+                    f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{turn['status']}\t"
+                    f"{fmt_duration(turn['duration_ms'])}\t{turn['tool_call_count']} tools\n"
+                )
+        except OSError:
+            pass
 
     # -- 主循环 ------------------------------------------------------------ #
     def _drain(self, now: float) -> None:
@@ -1319,6 +1415,7 @@ class Pet:
             self.canvas.itemconfig(self._sprite_item, image=frames[self._frame_i])
 
         self._rebuild_stats()
+        self._drain_turns()
         self.root.after(30, self._tick)
 
     # -- 配置 -------------------------------------------------------------- #
@@ -1340,6 +1437,7 @@ class Pet:
             topmost=self.topmost,
             bubbles=self.show_bubbles,
             speed=self.show_speed,
+            notify_done=self.notify_done,
             state=self.state,
             pet=self.pet_name,
         )
