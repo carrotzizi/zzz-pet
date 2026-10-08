@@ -925,6 +925,8 @@ class Pet:
         self.menu.add_checkbutton(label="总在最前", variable=self.var_top, command=self._toggle_top)
         self.menu.add_checkbutton(label="显示速度", variable=self.var_speed, command=self._toggle_speed)
         self.menu.add_separator()
+        self.menu.add_command(label="生成工作日志", command=self.generate_worklog)
+        self.menu.add_separator()
         self.menu.add_command(label="退出", command=self.quit)
         self._style_menu(self.menu)
 
@@ -1254,6 +1256,32 @@ class Pet:
     def _minimize_worker(self) -> None:
         ok = minimize_all_windows()
         self.events.put(("desktop", "ok" if ok else "fail", 0))
+
+    # -- 工作日志 ---------------------------------------------------------- #
+    def generate_worklog(self) -> None:
+        """菜单入口：生成今天的工作日志，然后直接打开给你看。
+
+        大概一两秒（要读会话库），所以放后台线程，别卡界面。
+        """
+        threading.Thread(target=self._worklog_worker, daemon=True).start()
+
+    def _worklog_worker(self) -> None:
+        try:
+            import datetime as _dt
+            import worklog  # 同目录的模块
+        except ImportError:
+            return  # 没有 worklog.py 就安静地算了
+        try:
+            day = _dt.date.today()
+            out = worklog.default_out(day)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(worklog.build(day), encoding="utf-8")
+        except (OSError, sqlite3.Error):
+            return
+        try:
+            os.startfile(out)  # 生成完直接打开，省得你再去找文件
+        except OSError:
+            pass
 
     def _after_show_desktop(self, ok: bool) -> None:
         """最小化之后把宠物自己放回桌面。
