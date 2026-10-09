@@ -319,13 +319,17 @@ ZCode 的钩子写在 `~/.zcode/cli/config.json`，本机已按官方 schema 配
 
 ## 开机自启
 
-已经配好了：启动文件夹里有一个快捷方式
+**目前是关掉的**——启动文件夹里的快捷方式已经删掉了，登录不会自己起来；
+`SessionStart` 钩子也从 `ensure_running.bat`（没在跑就拉起来）换成了 `hook.bat`
+（只设状态、不启动），所以现在没有任何路径会让它自动启动。
+
+想开回来的话，把快捷方式放回启动文件夹：
 
 ```
-%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\Eous Pet.lnk
+%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup
 ```
 
-指向 `pythonw.exe eous_pet.py`，登录即启动、不弹黑框。想取消就删掉这个快捷方式。
+指向 `pythonw.exe eous_pet.py`（不弹黑框），或者在资源管理器地址栏输入上面那行打开目录再拖进去。
 
 > 注意：宠物**不要**从 agent 的工具调用里启动。那样它是工具进程的子进程，
 > ZCode 一重启就会被整棵进程树一起清掉（这正是之前宠物消失的原因）。
